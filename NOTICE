@@ -1,0 +1,24 @@
+Chaoxing Deadline
+Copyright 2026 qingzhou704
+
+This project is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text.
+
+This project uses or references the following third-party components:
+
+- Android Gradle Plugin / Gradle Wrapper
+- Android SDK APIs
+- libxposed API 102
+- app/libs/service-102.0.0-patched.aar
+- app/libs/interface-102.0.0-patched.aar
+
+Third-party components are licensed under their respective licenses.
+When redistributing this project or its binary builds, keep the applicable upstream
+license, copyright, and notice information for those components.
+
+The patched AAR files are included only to build and run this LSPosed/Xposed module
+against the target libxposed API version. If these files are updated, replaced, or
+redistributed separately, verify and preserve the license and notice terms of their
+upstream source.
+
+This project is not affiliated with Chaoxing, Xuexitong, or any school platform.

@@ -12,6 +12,8 @@ import android.widget.TextView;
 
 public final class AboutActivity extends BaseActivity {
     private static final String GITHUB_URL = "https://github.com/Xposed-Modules-Repo/dev.codex.chaoxingdeadline";
+    private static final String LICENSE_URL = GITHUB_URL + "/blob/master/LICENSE";
+    private static final String NOTICE_URL = GITHUB_URL + "/blob/master/NOTICE";
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -55,11 +57,19 @@ public final class AboutActivity extends BaseActivity {
         content.addView(version, new LinearLayout.LayoutParams(-1, -2));
 
         // Links
-        View source = actionRow("查看源代码", "在 GitHub 上查看源代码");
+        View source = actionRow("查看源代码", "在 GitHub 上查看完整源代码");
         source.setOnClickListener(v -> startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(GITHUB_URL))));
         content.addView(source, groupParams());
 
-        View disclaimer = actionRow("免责声明", "本工具仅用于个人待办提醒，请遵守学校和学习通的使用规则。");
+        View license = actionRow("开源许可", "本项目基于 Apache License 2.0 开源");
+        license.setOnClickListener(v -> startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(LICENSE_URL))));
+        content.addView(license, groupParams());
+
+        View thirdParty = actionRow("第三方组件", "包含 libxposed API 102 与本地 patched AAR，组件遵循各自许可证");
+        thirdParty.setOnClickListener(v -> startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(NOTICE_URL))));
+        content.addView(thirdParty, groupParams());
+
+        View disclaimer = actionRow("免责声明", "本工具仅用于个人待办提醒；项目不隶属于超星、学习通或学校平台，请遵守相关使用规则。");
         content.addView(disclaimer, groupParams());
 
         return root;
