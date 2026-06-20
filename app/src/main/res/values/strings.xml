@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">学习通截止提醒</string>
+    <string name="app_description">自动捕获超星学习通作业和考试截止时间。</string>
+</resources>

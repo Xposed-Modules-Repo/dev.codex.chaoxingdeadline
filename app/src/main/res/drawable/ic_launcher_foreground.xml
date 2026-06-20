@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- clock circle -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:pathData="M54,30 A28,28 0 1,1 53.99,30" />
+
+    <!-- minute hand (deadline: 12 o'clock) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4.5"
+        android:strokeLineCap="round"
+        android:pathData="M54,54 L54,35" />
+
+    <!-- hour hand (pointing to ~10 o'clock) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:pathData="M54,54 L44,46" />
+
+    <!-- center dot -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M52,52 A3,3 0 1,1 51.99,52" />
+
+    <!-- deadline flag: small triangle at top-right -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M72,30 L82,34 L72,42 Z" />
+
+</vector>
