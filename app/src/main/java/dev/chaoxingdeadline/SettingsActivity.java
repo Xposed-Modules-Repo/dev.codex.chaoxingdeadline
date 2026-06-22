@@ -1,7 +1,12 @@
 package dev.chaoxingdeadline;
 
+import android.Manifest;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -54,21 +59,29 @@ public final class SettingsActivity extends BaseActivity {
         // -- 通知 --
         content.addView(sectionHeader("通知"));
         LinearLayout group2 = card();
-        group2.addView(switchRow("通知提醒", "到达设定时间后发送系统通知", AppSettings.notificationsEnabled(this),
-                (b, c) -> { AppSettings.prefs(this).edit().putBoolean("notify_enabled", c).apply(); DeadlineNotifier.rescheduleAll(this); }));
+        group2.addView(switchRow("最后提醒", "任务的截止时间到达3小时和30分钟时提醒", AppSettings.finalReminderEnabled(this),
+                (b, c) -> { AppSettings.prefs(this).edit().putBoolean("notify_enabled", c).apply(); DeadlineNotifier.rescheduleUpcomingOnly(this); }));
         group2.addView(divider());
-        group2.addView(switchRow("作业提醒", "仅提醒未提交的作业", AppSettings.notifyHomework(this),
-                (b, c) -> { AppSettings.prefs(this).edit().putBoolean("notify_homework", c).apply(); DeadlineNotifier.rescheduleAll(this); }));
+        group2.addView(switchRow("作业提醒", "作业到达设定的提醒时间提醒", AppSettings.notifyHomework(this),
+                (b, c) -> { AppSettings.prefs(this).edit().putBoolean("notify_homework", c).apply(); DeadlineNotifier.rescheduleUpcomingOnly(this); }));
         group2.addView(divider());
-        group2.addView(switchRow("考试提醒", "仅提醒未完成的考试", AppSettings.notifyExam(this),
-                (b, c) -> { AppSettings.prefs(this).edit().putBoolean("notify_exam", c).apply(); DeadlineNotifier.rescheduleAll(this); }));
+        group2.addView(switchRow("考试提醒", "考试到达设定的提醒时间提醒", AppSettings.notifyExam(this),
+                (b, c) -> { AppSettings.prefs(this).edit().putBoolean("notify_exam", c).apply(); DeadlineNotifier.rescheduleUpcomingOnly(this); }));
         group2.addView(divider());
         group2.addView(hourRow());
+        group2.addView(divider());
+        View exactAlarm = innerActionRow("精确闹钟权限", exactAlarmSubtitle());
+        exactAlarm.setOnClickListener(v -> openExactAlarmSettings());
+        group2.addView(exactAlarm);
+        group2.addView(divider());
+        View testNotification = innerActionRow("发送测试通知", "立即发送一条作业提醒，用来查看通知效果");
+        testNotification.setOnClickListener(v -> sendTestNotification());
+        group2.addView(testNotification);
         content.addView(group2, groupParams());
 
         // -- 管理 --
         content.addView(sectionHeader("管理"));
-        View course = actionRow("课程屏蔽", "选择要屏蔽的课程和待办类型");
+        View course = actionRow("课程管理", "手动选择哪些课程的作业和考试需要显示");
         course.setOnClickListener(v -> startActivity(new Intent(this, CourseBlockActivity.class)));
         content.addView(course, groupParams());
 
@@ -112,7 +125,7 @@ public final class SettingsActivity extends BaseActivity {
         LinearLayout texts = new LinearLayout(this);
         texts.setOrientation(LinearLayout.VERTICAL);
         texts.setGravity(Gravity.CENTER_VERTICAL);
-        texts.addView(text("提前提醒时间", 16, true, UiTheme.text(this)), new LinearLayout.LayoutParams(-1, -2));
+        texts.addView(text("提醒时间", 16, true, UiTheme.text(this)), new LinearLayout.LayoutParams(-1, -2));
         TextView sub = text("小时，范围 1 — 168", 13, false, UiTheme.muted(this));
         sub.setPadding(0, dp(2), 0, 0);
         texts.addView(sub, new LinearLayout.LayoutParams(-1, -2));
@@ -143,9 +156,45 @@ public final class SettingsActivity extends BaseActivity {
         hours = Math.max(1, Math.min(168, hours));
         notifyHours.setText(String.valueOf(hours));
         AppSettings.prefs(this).edit().putInt("notify_hours", hours).apply();
-        DeadlineNotifier.checkAll(this);
+        DeadlineNotifier.rescheduleUpcomingOnly(this);
         OverlayBridge.publish(this);
-        Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "操作成功", Toast.LENGTH_SHORT).show();
+    }
+
+    private String exactAlarmSubtitle() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return "当前系统无需单独授权";
+        }
+        return DeadlineNotifier.canScheduleExactAlarms(this)
+                ? "已允许，提醒会更准时"
+                : "未允许，提醒可能延迟，点击前往开启";
+    }
+
+    private void openExactAlarmSettings() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            Toast.makeText(this, "当前系统无需单独开启精确闹钟", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        try {
+            Intent intent = new Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM)
+                    .setData(Uri.parse("package:" + getPackageName()));
+            startActivity(intent);
+        } catch (Throwable throwable) {
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                    .setData(Uri.parse("package:" + getPackageName())));
+        }
+    }
+
+    private void sendTestNotification() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1002);
+            Toast.makeText(this, "请先允许通知权限", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        DeadlineNotifier.ensureChannel(this);
+        DeadlineNotifier.sendTestNotification(this);
+        Toast.makeText(this, "已发送测试通知", Toast.LENGTH_SHORT).show();
     }
 
     private View switchRow(String title, String subtitle, boolean checked, CompoundButton.OnCheckedChangeListener listener) {
@@ -173,12 +222,22 @@ public final class SettingsActivity extends BaseActivity {
         return row;
     }
 
+    private View innerActionRow(String title, String subtitle) {
+        return actionRow(title, subtitle, false);
+    }
+
     private View actionRow(String title, String subtitle) {
+        return actionRow(title, subtitle, true);
+    }
+
+    private View actionRow(String title, String subtitle, boolean standalone) {
         LinearLayout row = new LinearLayout(this);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding(dp(16), dp(15), dp(16), dp(15));
         row.setMinimumHeight(dp(70));
-        row.setBackground(UiTheme.cardBg(this));
+        if (standalone) {
+            row.setBackground(UiTheme.cardBg(this));
+        }
 
         LinearLayout texts = new LinearLayout(this);
         texts.setOrientation(LinearLayout.VERTICAL);

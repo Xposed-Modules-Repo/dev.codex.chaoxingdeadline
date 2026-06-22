@@ -30,7 +30,7 @@ public final class CourseBlockActivity extends BaseActivity {
         root.setBackgroundColor(UiTheme.background(this));
         root.setPadding(dp(20), statusBarHeight() + dp(8), dp(20), dp(16));
 
-        root.addView(titleBar("课程屏蔽"), new LinearLayout.LayoutParams(-1, dp(48)));
+        root.addView(titleBar("课程管理"), new LinearLayout.LayoutParams(-1, dp(48)));
 
         ScrollView scroll = new ScrollView(this);
         LinearLayout content = new LinearLayout(this);
@@ -39,9 +39,14 @@ public final class CourseBlockActivity extends BaseActivity {
         scroll.addView(content, new ScrollView.LayoutParams(-1, -2));
         root.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
 
-        // Clear all
-        View clear = actionRow("⊘", "清空全部屏蔽", "恢复显示所有课程的作业和考试");
-        clear.setOnClickListener(v -> { store.clearBlockedCourses(); Toast.makeText(this, "已清空屏蔽设置", Toast.LENGTH_SHORT).show(); reload(); });
+        View clear = actionRow("↻", "清空手动屏蔽", "恢复所有课程的作业和考试显示");
+        clear.setOnClickListener(v -> {
+            store.clearBlockedCourses();
+            OverlayBridge.publish(this);
+            DeadlineNotifier.rescheduleUpcomingOnly(this);
+            Toast.makeText(this, "操作成功", Toast.LENGTH_SHORT).show();
+            reload();
+        });
         content.addView(clear, groupParams());
 
         list = new LinearLayout(this);
@@ -57,7 +62,7 @@ public final class CourseBlockActivity extends BaseActivity {
             LinearLayout empty = card();
             empty.setGravity(Gravity.CENTER);
             empty.setPadding(dp(24), dp(36), dp(24), dp(36));
-            TextView t = text("还没有读取到课程。\n回首页刷新一次，或打开学习通后再回来。", 14, false, UiTheme.muted(this));
+            TextView t = text("还没有读取到课程。\n打开学习通后会自动读取课程。", 14, false, UiTheme.muted(this));
             t.setGravity(Gravity.CENTER);
             empty.addView(t, new LinearLayout.LayoutParams(-1, -2));
             list.addView(empty, groupParams());
@@ -80,11 +85,15 @@ public final class CourseBlockActivity extends BaseActivity {
 
     private void addTypeCheck(LinearLayout parent, String course, String type) {
         CheckBox cb = new CheckBox(this);
-        cb.setText(type);
+        cb.setText("查询" + type);
         cb.setTextSize(14);
         cb.setTextColor(UiTheme.text(this));
-        cb.setChecked(store.isBlocked(course, type));
-        cb.setOnCheckedChangeListener((b, c) -> store.blockCourseType(course, type, c));
+        cb.setChecked(store.isCourseTypeEnabled(course, type));
+        cb.setOnCheckedChangeListener((b, c) -> {
+            store.setCourseTypeEnabled(course, type, c);
+            OverlayBridge.publish(this);
+            DeadlineNotifier.rescheduleUpcomingOnly(this);
+        });
         parent.addView(cb, new LinearLayout.LayoutParams(0, -2, 1f));
     }
 

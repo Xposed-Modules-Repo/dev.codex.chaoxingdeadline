@@ -13,6 +13,7 @@ import io.github.libxposed.service.XposedService;
 public final class OverlayBridge {
     public static final String PREFS = "overlay_data";
     public static final String KEY_ITEMS = "items";
+    public static final String KEY_SUPPRESSED = "suppressed";
     public static final String KEY_UPDATED_AT = "updated_at";
 
     private OverlayBridge() {
@@ -35,8 +36,10 @@ public final class OverlayBridge {
                 return Long.compare(a.dueAt, b.dueAt);
             });
             JSONArray array = new JSONArray();
+            JSONArray suppressed = new JSONArray();
             for (DeadlineItem item : items) {
-                if (item.dueAt <= now) {
+                if (item.dueAt <= now || item.submitted) {
+                    suppressed.put(identityJson(item));
                     continue;
                 }
                 JSONObject json = new JSONObject();
@@ -44,14 +47,24 @@ public final class OverlayBridge {
                 json.put("title", item.title);
                 json.put("course", item.course);
                 json.put("dueAt", item.dueAt);
+                json.put("submitted", item.submitted);
                 array.put(json);
             }
             service.getRemotePreferences(PREFS)
                     .edit()
                     .putString(KEY_ITEMS, array.toString())
+                    .putString(KEY_SUPPRESSED, suppressed.toString())
                     .putLong(KEY_UPDATED_AT, now)
                     .apply();
         } catch (Throwable ignored) {
         }
+    }
+
+    private static JSONObject identityJson(DeadlineItem item) throws Exception {
+        JSONObject json = new JSONObject();
+        json.put("type", item.type);
+        json.put("title", item.title);
+        json.put("dueAt", item.dueAt);
+        return json;
     }
 }

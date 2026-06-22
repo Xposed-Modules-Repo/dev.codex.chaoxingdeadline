@@ -17,12 +17,13 @@ public final class App extends Application implements XposedServiceHelper.OnServ
         BridgeAuth.ensureToken(this);
         DeadlineNotifier.ensureChannel(this);
         XposedServiceHelper.registerListener(this);
-        DeadlineNotifier.rescheduleAll(this);
+        DeadlineNotifier.rescheduleUpcomingOnly(this);
     }
 
     @Override
     public void onServiceBind(XposedService service) {
         App.service = service;
+        AppSettings.syncRemotePreferences(this);
         OverlayBridge.publish(this);
         for (ServiceListener listener : listeners) {
             listener.onServiceChanged(service);

@@ -19,7 +19,9 @@ public final class DeadlineParser {
             "deadline", "deadLine", "dueTime", "duetime", "endTime", "endtime", "end_time",
             "endDate", "enddate", "closeTime", "finishTime", "expireTime", "stopTime",
             "submitEndTime", "submitendtime", "workEndTime", "examEndTime", "lastSubmitTime",
-            "endtimeStr", "endTimeStr", "taskEndTime", "limitTime", "limittime"
+            "activityEndTime", "answerEndTime", "answerEndtime", "deadlineTime", "endDateTime",
+            "endtimeStr", "endTimeStr", "taskEndTime", "limitTime", "limittime",
+            "nameFour", "namefour", "nameFive", "namefive"
     };
     private static final String[] TITLE_KEYS = {
             "title", "name", "workName", "examName", "courseName", "chapterName",
@@ -122,9 +124,7 @@ public final class DeadlineParser {
             String attrs = matcher.group(1);
             String li = matcher.group(2);
             String plain = stripTags(li);
-            if (isHtmlSubmitted(plain)) {
-                continue;
-            }
+            int submissionState = htmlSubmissionState(plain);
             long dueAt = parseDueFromText(plain, context);
             if (dueAt <= System.currentTimeMillis()) {
                 continue;
@@ -154,7 +154,7 @@ public final class DeadlineParser {
             item.course = clean(stripTags(course));
             item.courseConfidence = confidence;
             item.dueAt = dueAt;
-            item.submitted = false;
+            item.setSubmissionState(submissionState);
             item.source = context == null ? "" : context.source;
             item.url = context == null ? "" : context.url;
             item.raw = matcher.group(0);
@@ -172,18 +172,18 @@ public final class DeadlineParser {
         }
     }
 
-    private static boolean isHtmlSubmitted(String plain) {
+    private static int htmlSubmissionState(String plain) {
         if (plain == null) {
-            return false;
+            return DeadlineItem.SUBMISSION_UNKNOWN;
         }
         boolean explicitlyUnfinished = plain.contains("未完成") || plain.contains("未提交")
                 || plain.contains("未交") || plain.contains("待完成") || plain.contains("待提交");
         if (explicitlyUnfinished) {
-            return false;
+            return DeadlineItem.SUBMISSION_UNSUBMITTED;
         }
-        return plain.contains("待批阅") || plain.contains("已提交")
-                || plain.contains("已完成") || plain.contains("已结束") || plain.contains("已过期")
-                || (plain.contains("已交") && !plain.contains("未交"));
+        boolean explicitlySubmitted = plain.contains("待批阅") || plain.contains("已提交")
+                || plain.contains("已完成") || (plain.contains("已交") && !plain.contains("未交"));
+        return explicitlySubmitted ? DeadlineItem.SUBMISSION_SUBMITTED : DeadlineItem.SUBMISSION_UNKNOWN;
     }
 
     private static boolean badCourseText(String course) {
@@ -245,13 +245,13 @@ public final class DeadlineParser {
 
     private static boolean allowRelativeDueFallback(ParseContext context) {
         String source = context == null || context.source == null ? "" : context.source;
-        // The broad work/exam landing pages usually only show "remaining X days Y hours".
-        // Turning that into an exact timestamp is what produced fake minutes like :04.
-        // Keep relative parsing only for course-scoped detail/list responses as a last resort.
-        if (source.contains("workPage") || source.contains("examPage")) {
+        // The all-work page is currently the only active endpoint that reliably exposes
+        // unfinished homework plus remaining time. Keep examPage disabled because it often
+        // lacks a usable remaining/deadline signal and would create noisy guesses.
+        if (source.contains("examPage")) {
             return false;
         }
-        return source.contains("workList") || source.contains("examList")
+        return source.contains("workPage") || source.contains("workList") || source.contains("examList")
                 || source.contains("taskList") || source.contains("chapter");
     }
 
@@ -400,8 +400,8 @@ public final class DeadlineParser {
         if (isActiveChapterListSource(source) && !isUnfinishedChapterNode(object, path)) {
             return null;
         }
-        boolean submitted = isSubmitted(object);
-        if (submitted || dueAt <= now) {
+        int submissionState = submissionState(object);
+        if (dueAt <= now) {
             return null;
         }
         String type = inferType(object, path, source);
@@ -424,7 +424,7 @@ public final class DeadlineParser {
         item.course = clean(course);
         item.courseConfidence = confidence;
         item.dueAt = dueAt;
-        item.submitted = false;
+        item.setSubmissionState(submissionState);
         item.source = source;
         item.url = context == null ? "" : context.url;
         item.raw = object.toString();
@@ -546,18 +546,42 @@ public final class DeadlineParser {
             } catch (ParseException ignored) {
             }
         }
-        return 0L;
+        long embedded = parseTimeFromFreeText(text);
+        return embedded > 0 ? embedded : parseMonthDayTime(text);
     }
 
     private static boolean isDateOnly(String text) {
         return text != null && text.matches("20\\d{2}(?:[-/.]\\d{1,2}[-/.]\\d{1,2}|年\\d{1,2}月\\d{1,2}日?)");
     }
 
+    private static long parseMonthDayTime(String text) {
+        if (text == null || text.isEmpty()) {
+            return 0L;
+        }
+        Matcher matcher = Pattern.compile("(\\d{1,2})\\s*月\\s*(\\d{1,2})\\s*日(?:\\s+|[^0-9]+)(\\d{1,2}):(\\d{2})(?::(\\d{2}))?").matcher(text);
+        if (!matcher.find()) {
+            return 0L;
+        }
+        java.util.Calendar calendar = java.util.Calendar.getInstance(Locale.CHINA);
+        calendar.set(java.util.Calendar.MONTH, Integer.parseInt(matcher.group(1)) - 1);
+        calendar.set(java.util.Calendar.DAY_OF_MONTH, Integer.parseInt(matcher.group(2)));
+        calendar.set(java.util.Calendar.HOUR_OF_DAY, Integer.parseInt(matcher.group(3)));
+        calendar.set(java.util.Calendar.MINUTE, Integer.parseInt(matcher.group(4)));
+        calendar.set(java.util.Calendar.SECOND, matcher.group(5) == null ? 0 : Integer.parseInt(matcher.group(5)));
+        calendar.set(java.util.Calendar.MILLISECOND, 0);
+        long parsed = calendar.getTimeInMillis();
+        if (parsed <= System.currentTimeMillis()) {
+            calendar.add(java.util.Calendar.YEAR, 1);
+            parsed = calendar.getTimeInMillis();
+        }
+        return plausible(parsed) ? parsed : 0L;
+    }
+
     private static boolean plausible(long millis) {
         return millis > 1_577_836_800_000L && millis < 2_208_988_800_000L;
     }
 
-    private static boolean isSubmitted(JSONObject object) {
+    private static int submissionState(JSONObject object) {
         Iterator<String> keys = object.keys();
         while (keys.hasNext()) {
             String key = keys.next();
@@ -569,20 +593,30 @@ public final class DeadlineParser {
             if (!submitKey) {
                 continue;
             }
-            if (value instanceof Boolean && (Boolean) value) {
-                return true;
+            if (value instanceof Boolean) {
+                if (lower.contains("submit") || lower.contains("finish") || lower.contains("complete")) {
+                    return (Boolean) value ? DeadlineItem.SUBMISSION_SUBMITTED
+                            : DeadlineItem.SUBMISSION_UNSUBMITTED;
+                }
+                continue;
             }
-            if (value instanceof Number && ((Number) value).intValue() > 0
-                    && (lower.contains("submit") || lower.contains("finish") || lower.contains("complete"))) {
-                return true;
+            if (value instanceof Number && (lower.contains("submit") || lower.contains("finish") || lower.contains("complete"))) {
+                return ((Number) value).intValue() > 0
+                        ? DeadlineItem.SUBMISSION_SUBMITTED : DeadlineItem.SUBMISSION_UNSUBMITTED;
             }
             String text = String.valueOf(value).toLowerCase(Locale.ROOT);
+            if (text.contains("未提交") || text.contains("未完成") || text.contains("未交")
+                    || text.contains("unsubmitted") || text.contains("unfinished")
+                    || "false".equals(text) || "no".equals(text)) {
+                return DeadlineItem.SUBMISSION_UNSUBMITTED;
+            }
             if ("true".equals(text) || "yes".equals(text) || text.contains("已提交")
-                    || text.contains("已完成") || text.contains("submitted") || text.contains("finished")) {
-                return true;
+                    || text.contains("已完成") || text.contains("待批阅")
+                    || text.contains("submitted") || text.contains("finished")) {
+                return DeadlineItem.SUBMISSION_SUBMITTED;
             }
         }
-        return false;
+        return DeadlineItem.SUBMISSION_UNKNOWN;
     }
 
     private static String inferType(JSONObject object, String path, String source) {

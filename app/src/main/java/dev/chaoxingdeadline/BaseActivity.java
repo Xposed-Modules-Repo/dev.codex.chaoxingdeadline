@@ -3,7 +3,6 @@ package dev.chaoxingdeadline;
 import android.app.Activity;
 import android.graphics.Color;
 import android.graphics.Typeface;
-import android.os.Build;
 import android.view.Gravity;
 import android.view.View;
 import android.view.Window;
@@ -48,8 +47,6 @@ public class BaseActivity extends Activity {
         return v;
     }
 
-
-
     protected LinearLayout hbox() {
         LinearLayout v = new LinearLayout(this);
         v.setOrientation(LinearLayout.HORIZONTAL);
@@ -67,12 +64,14 @@ public class BaseActivity extends Activity {
         return v;
     }
 
+    @SuppressWarnings("deprecation")
     protected void applySystemBars() {
         Window window = getWindow();
         window.setStatusBarColor(UiTheme.background(this));
         window.setNavigationBarColor(UiTheme.background(this));
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !UiTheme.dark(this))
+        if (!UiTheme.dark(this)) {
             window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR);
+        }
     }
 
     protected int statusBarHeight() {

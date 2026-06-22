@@ -1,13 +1,13 @@
 package dev.chaoxingdeadline;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
-import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -18,11 +18,9 @@ import android.view.View;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import java.text.SimpleDateFormat;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -33,8 +31,7 @@ import io.github.libxposed.service.XposedService;
 
 /**
  * Main screen: displays LSPosed activation status, deadline stats, and the deadline list.
- * Automatically refreshes every 5 seconds. Users can manually trigger an active refresh
- * which sends a command to the hook module via remote SharedPreferences.
+ * The app screen only reloads local data; deadline capture is driven by the Chaoxing hook.
  */
 public final class MainActivity extends BaseActivity implements App.ServiceListener {
     private static final String TARGET_PACKAGE = "com.chaoxing.mobile";
@@ -69,6 +66,7 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
     }
 
     @Override
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
     protected void onStart() {
         super.onStart();
         App.addServiceListener(this);
@@ -78,7 +76,6 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         else
             registerReceiver(refreshReceiver, filter);
         handler.post(tick);
-        DeadlineNotifier.checkAll(this);
     }
 
     @Override
@@ -129,26 +126,13 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         countBlocked = new TextView(this);
         stats.addView(statChip("⏳", "待办", countPending), chipParams(1f));
         stats.addView(space(dp(10)));
-        stats.addView(statChip("✓", "已截止", countExpired), chipParams(1f));
+        stats.addView(statChip("✓", "已完成", countExpired), chipParams(1f));
         stats.addView(space(dp(10)));
         stats.addView(statChip("⊘", "已屏蔽", countBlocked), chipParams(1f));
         root.addView(stats, marTop(dp(16)));
 
-        // --- section + refresh ---
+        // --- section ---
         root.addView(sectionHeader("待办事项"));
-
-        TextView refreshBtn = new TextView(this);
-        refreshBtn.setText("刷新");
-        refreshBtn.setTextSize(14);
-        refreshBtn.setTextColor(Color.WHITE);
-        refreshBtn.setGravity(Gravity.CENTER);
-        refreshBtn.setPadding(dp(36), dp(11), dp(36), dp(11));
-        refreshBtn.setBackground(UiTheme.fillOnly(this, UiTheme.accent(this), dp(20)));
-        refreshBtn.setOnClickListener(v -> { requestActiveRefresh(true); reload(false); });
-        LinearLayout actions = new LinearLayout(this);
-        actions.setPadding(0, dp(6), 0, dp(12));
-        actions.addView(refreshBtn, new LinearLayout.LayoutParams(-2, -2));
-        root.addView(actions, new LinearLayout.LayoutParams(-1, -2));
 
         // --- item list ---
         itemList = new LinearLayout(this);
@@ -209,7 +193,7 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         items.clear();
         items.addAll(store.activeItems());
         if (firstLoad) {
-            DeadlineNotifier.rescheduleAll(this, new ArrayList<>(items));
+            DeadlineNotifier.rescheduleUpcomingOnly(this, new ArrayList<>(items));
             OverlayBridge.publish(this);
         }
         rebuildItemList();
@@ -222,7 +206,7 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         int pending = 0, expired = 0, blocked = store.blockedCourses().size();
         long now = System.currentTimeMillis();
         for (DeadlineItem item : items) {
-            if (item.dueAt <= now) expired++;
+            if (item.submitted || item.dueAt <= now) expired++;
             else pending++;
         }
 
@@ -237,26 +221,27 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
                 ? "暂无待办\n\n打开学习通后会自动捕获作业和考试截止时间。"
                 : "尚未检测到激活\n\n请在 LSPosed 中勾选本模块，作用域选择「学习通」。");
 
-        if (firstLoad && activation.active) requestActiveRefresh(false);
     }
 
     private void rebuildItemList() {
         itemList.removeAllViews();
-        // sort: active first (earliest deadline top), then expired (most recent first)
+        // sort: pending first (earliest deadline top), then submitted/expired items.
         long now = System.currentTimeMillis();
         List<DeadlineItem> sorted = new ArrayList<>(items);
         Collections.sort(sorted, (a, b) -> {
-            boolean aExp = a.dueAt <= now, bExp = b.dueAt <= now;
-            if (aExp != bExp) return aExp ? 1 : -1;
-            // both active: sooner first; both expired: more recently expired first
-            return aExp ? Long.compare(b.dueAt, a.dueAt) : Long.compare(a.dueAt, b.dueAt);
+            boolean aDone = a.submitted || a.dueAt <= now;
+            boolean bDone = b.submitted || b.dueAt <= now;
+            if (aDone != bDone) return aDone ? 1 : -1;
+            return aDone ? Long.compare(b.dueAt, a.dueAt) : Long.compare(a.dueAt, b.dueAt);
         });
         for (DeadlineItem item : sorted) itemList.addView(itemRow(item), rowParams());
     }
 
     private View itemRow(DeadlineItem item) {
         long delta = item.dueAt - System.currentTimeMillis();
-        boolean expired = delta <= 0L, urgent = !expired && delta <= 24L * 60L * 60L * 1000L;
+        boolean expired = delta <= 0L;
+        boolean done = item.submitted || expired;
+        boolean urgent = !done && delta <= 24L * 60L * 60L * 1000L;
 
         // outer wrapper: swipe on expired items
         LinearLayout swipeWrapper = new LinearLayout(this);
@@ -269,7 +254,7 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         card.setOrientation(LinearLayout.HORIZONTAL);
         card.setPadding(dp(16), dp(15), dp(16), dp(15));
         card.setBackground(urgent ? UiTheme.fillOnly(this, UiTheme.dangerBg(this), dp(16)) : UiTheme.cardBg(this, 16));
-        card.setAlpha(expired ? 0.55f : 1f);
+        card.setAlpha(done ? 0.55f : 1f);
 
         TextView badge = new TextView(this);
         badge.setText("作业".equals(item.type) ? "作" : "考");
@@ -288,7 +273,7 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         texts.setOrientation(LinearLayout.VERTICAL);
         texts.setGravity(Gravity.CENTER_VERTICAL);
 
-        int titleColor = expired ? UiTheme.muted(this) : UiTheme.text(this);
+        int titleColor = done ? UiTheme.muted(this) : UiTheme.text(this);
         TextView tvTitle = text(item.title, 15, true, titleColor);
         texts.addView(tvTitle, new LinearLayout.LayoutParams(-1, -2));
 
@@ -297,25 +282,26 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
         tvCourse.setPadding(0, dp(4), 0, 0);
         texts.addView(tvCourse, new LinearLayout.LayoutParams(-1, -2));
 
-        int dueColor = expired ? UiTheme.muted(this) : UiTheme.accent(this);
-        TextView tvDue = text(DateText.dueLine(item.dueAt), 12, false, dueColor);
+        int dueColor = done ? UiTheme.muted(this) : UiTheme.accent(this);
+        String dueText = item.submitted ? "已提交 · 截止：" + DateText.deadlineTime(item.dueAt) : DateText.dueLine(item.dueAt);
+        TextView tvDue = text(dueText, 12, false, dueColor);
         tvDue.setPadding(0, dp(4), 0, 0);
         texts.addView(tvDue, new LinearLayout.LayoutParams(-1, -2));
 
         card.addView(texts, new LinearLayout.LayoutParams(0, -2, 1f));
 
-        // "已截止" label on the right for expired items
-        if (expired) {
-            TextView expiredLabel = text("已截止", 13, false, UiTheme.muted(this));
-            expiredLabel.setPadding(dp(10), 0, 0, 0);
-            expiredLabel.setGravity(Gravity.CENTER_VERTICAL);
-            card.addView(expiredLabel, new LinearLayout.LayoutParams(-2, -2));
+        // terminal label on the right for submitted/expired items
+        if (done) {
+            TextView doneLabel = text(item.submitted ? "已提交" : "已截止", 13, false, UiTheme.muted(this));
+            doneLabel.setPadding(dp(10), 0, 0, 0);
+            doneLabel.setGravity(Gravity.CENTER_VERTICAL);
+            card.addView(doneLabel, new LinearLayout.LayoutParams(-2, -2));
         }
 
         swipeWrapper.addView(card, new LinearLayout.LayoutParams(-1, -2));
 
-        // swipe-to-delete for expired items
-        if (expired) {
+        // swipe-to-delete for terminal items
+        if (done) {
             card.setTag("swipeable");
             card.setOnTouchListener(new SwipeDismissListener(item, swipeWrapper, card));
         }
@@ -348,48 +334,19 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
             } catch (Throwable ignored) {}
         }
 
-        boolean active = targetRunning || activeAt > 0L;
+        boolean loaded = serviceReady || activeAt > 0L || targetRunning;
         StringBuilder detail = new StringBuilder();
         detail.append(serviceReady ? "LSPosed 已连接" : "LSPosed 未连接");
         if (!framework.isEmpty()) detail.append(" · ").append(framework);
         detail.append("\n学习通进程：").append(targetRunning ? "运行中" : "未运行");
         if (targetRunning) detail.append("\n最近加载：当前运行中");
         else if (activeAt > 0L) detail.append("\n最近加载：").append(format(activeAt));
+        else if (serviceReady) detail.append("\n状态说明：模块已加载，打开学习通后开始捕获");
         if (captureAt > 0L) detail.append("\n最近捕获：").append(format(captureAt));
-        String title = targetRunning ? "LSPosed 已激活" : (active ? "LSPosed 状态：已加载" : "LSPosed 状态：未激活");
-        return new Activation(title, detail.toString(), active);
+        String title = targetRunning ? "LSPosed 已激活" : (loaded ? "LSPosed 状态：已加载" : "LSPosed 状态：未连接");
+        return new Activation(title, detail.toString(), loaded);
     }
 
-    private void requestActiveRefresh(boolean launchIfNeeded) {
-        XposedService service = App.getService();
-        if (service != null) {
-            try {
-                sendRefreshCommand(service);
-                DeadlineNotifier.rescheduleAll(this);
-                OverlayBridge.publish(this);
-                getSharedPreferences("status", MODE_PRIVATE).edit()
-                        .putString("last_status", "已请求主动刷新").putString("last_source", "本软件").apply();
-            } catch (Throwable t) {
-                Toast.makeText(this, "刷新失败：" + t.getClass().getSimpleName(), Toast.LENGTH_SHORT).show();
-            }
-        }
-        if (launchIfNeeded) {
-            boolean running = false;
-            if (service != null) try {
-                for (HookedTarget target : service.getRunningTargets())
-                    if (TARGET_PACKAGE.equals(target.getProcessName())) running = true;
-            } catch (Throwable ignored) {}
-            if (!running) {
-                Intent launch = getPackageManager().getLaunchIntentForPackage(TARGET_PACKAGE);
-                if (launch != null) { launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); startActivity(launch); }
-            }
-        }
-    }
-
-    private void sendRefreshCommand(XposedService service) {
-        try { service.getRemotePreferences("commands").edit().putLong("refresh_seq", System.currentTimeMillis()).apply(); }
-        catch (Throwable t) { Toast.makeText(this, "失败：" + t.getClass().getSimpleName(), Toast.LENGTH_SHORT).show(); }
-    }
 
     private String format(long millis) {
         return new SimpleDateFormat("MM-dd HH:mm:ss", Locale.CHINA).format(new Date(millis));
@@ -438,13 +395,13 @@ public final class MainActivity extends BaseActivity implements App.ServiceListe
                         card.animate().translationX(-wrapper.getWidth()).alpha(0f)
                                 .setDuration(250)
                                 .withEndAction(() -> {
-                                    store.deleteItem(item.id);
+                                    DeadlineNotifier.deleteItem(MainActivity.this, item.id);
                                     items.remove(item);
                                     itemList.removeView(wrapper);
                                     long now = System.currentTimeMillis();
                                     int pending = 0, expired = 0;
                                     for (DeadlineItem it : items) {
-                                        if (it.dueAt <= now) expired++; else pending++;
+                                        if (it.submitted || it.dueAt <= now) expired++; else pending++;
                                     }
                                     countPending.setText(String.valueOf(pending));
                                     countExpired.setText(String.valueOf(expired));

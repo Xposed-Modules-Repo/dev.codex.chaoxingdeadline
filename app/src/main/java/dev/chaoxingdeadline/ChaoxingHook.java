@@ -1,5 +1,6 @@
 package dev.chaoxingdeadline;
 
+import android.annotation.SuppressLint;
 import android.app.Application;
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -10,7 +11,6 @@ import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -27,6 +27,7 @@ import org.json.JSONObject;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -39,12 +40,16 @@ import java.util.Base64;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
-import java.util.Iterator;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -61,34 +66,38 @@ import io.github.libxposed.api.XposedModule;
 
 public final class ChaoxingHook extends XposedModule {
     private static final String TAG = "ChaoxingDeadline";
-    private static final String BUILD_TAG = "build-20260618-2045";
-    // Experimental chapter scanner: scans chapter-level task structures for extra deadlines.
-    // Intentionally disabled (kept, not deleted). While false, the chapter helpers
-    // (collectAndFetchChapterCards / collectChapterRefs / ChapterRef and the chapter-source
-    // branches in DeadlineParser) stay dormant on purpose so the feature can be re-enabled
-    // without rewriting it. When false, only the standard work list / exam list APIs are used.
-    private static final boolean CHAPTER_TASKS_ENABLED = false;
+    private static final String HOOK_VERSION = "1.2";
     private static final String TARGET_PACKAGE = "com.chaoxing.mobile";
     private static final String MODULE_PACKAGE = "dev.chaoxingdeadline";
+    private static final long AUTO_REFRESH_MIN_GAP_MS = 3L * 60L * 1000L;
+    private static final int COURSE_FETCH_THREADS = 3;
+    private static final Object LIFECYCLE_LOCK = new Object();
     private static final ThreadLocal<Boolean> PARSING = ThreadLocal.withInitial(() -> false);
     private static final ArrayList<DeadlineItem> PENDING = new ArrayList<>();
     private static final Set<String> FETCHED_URLS = new HashSet<>();
     private static final Map<String, String> COURSE_NAMES = new HashMap<>();
     private static final Map<Object, ParseContext> RESPONSE_CONTEXTS = Collections.synchronizedMap(new WeakHashMap<>());
     private static final ArrayList<DeadlineItem> RECENT_ITEMS = new ArrayList<>();
+    @SuppressLint("StaticFieldLeak")
     private static volatile Context hostContext;
-    private static volatile Activity currentActivity;
-    private static volatile boolean commandListenerInstalled;
-    private static volatile long lastRefreshSeq;
+    private static volatile WeakReference<Activity> currentActivityRef;
     private static volatile long antiSpiderUntil;
-    private static volatile int scanCursor;
     private static volatile long lastOverlayAt;
     private static volatile long lastHomeSeenAt;
-    private static volatile SharedPreferences.OnSharedPreferenceChangeListener commandListener;
+    private static volatile long lastAutoRefreshAt;
+    private static volatile String lastOverlayFingerprint;
+    private static volatile int startedActivityCount;
+    private static volatile boolean lifecycleCallbacksRegistered;
+    private static volatile boolean overlayDialogShowing;
+    private static volatile boolean overlayScheduled;
+    private static volatile boolean overlayRetryAfterDialog;
+    private static volatile boolean activeRefreshRunning;
+    private static volatile boolean foregroundRefreshStarted;
+
 
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
-        log(Log.INFO, TAG, BUILD_TAG + " loaded in " + param.getProcessName() + ", framework "
+        log(Log.INFO, TAG, "hook v" + HOOK_VERSION + " loaded in " + param.getProcessName() + ", framework "
                 + getFrameworkName() + " API " + getApiVersion());
     }
 
@@ -109,9 +118,7 @@ public final class ChaoxingHook extends XposedModule {
         installOkHttpHooks(param.getClassLoader());
         installWebViewHooks();
         installActivityOverlayHook();
-        installCommandListener();
         emitStatus("hooks installed", "onPackageReady");
-        activeRefresh("onPackageReady");
     }
 
     @Override
@@ -134,16 +141,80 @@ public final class ChaoxingHook extends XposedModule {
                         Object result = chain.proceed();
                         Object arg = chain.getArg(0);
                         if (arg instanceof Context) {
-                        hostContext = ((Context) arg).getApplicationContext();
-                        flushPending();
-                        emitStatus("active", "Application.attach");
-                        log(Log.INFO, TAG, "host context ready");
+                            hostContext = ((Context) arg).getApplicationContext();
+                            Object receiver = chain.getThisObject();
+                            if (receiver instanceof Application) {
+                                registerForegroundCallbacks((Application) receiver);
+                            }
+                            flushPending();
+                            emitStatus("active", "Application.attach");
+                            log(Log.INFO, TAG, "host context ready");
                         }
                         return result;
                     });
         } catch (Throwable throwable) {
             log(Log.ERROR, TAG, "failed to hook Application.attach", throwable);
         }
+    }
+
+    private void registerForegroundCallbacks(Application application) {
+        synchronized (LIFECYCLE_LOCK) {
+            if (lifecycleCallbacksRegistered) {
+                return;
+            }
+            lifecycleCallbacksRegistered = true;
+        }
+        application.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
+            @Override
+            public void onActivityStarted(Activity activity) {
+                boolean enteredForeground;
+                synchronized (LIFECYCLE_LOCK) {
+                    enteredForeground = startedActivityCount == 0;
+                    startedActivityCount++;
+                }
+                currentActivityRef = new WeakReference<>(activity);
+                if (enteredForeground) {
+                    foregroundRefreshStarted = false;
+                }
+                maybeStartForegroundRefresh(activity);
+            }
+
+            @Override
+            public void onActivityStopped(Activity activity) {
+                synchronized (LIFECYCLE_LOCK) {
+                    if (startedActivityCount > 0) {
+                        startedActivityCount--;
+                    }
+                    if (startedActivityCount == 0) {
+                        foregroundRefreshStarted = false;
+                    }
+                }
+            }
+
+            @Override public void onActivityCreated(Activity activity, Bundle savedInstanceState) {}
+            @Override public void onActivityResumed(Activity activity) {
+                currentActivityRef = new WeakReference<>(activity);
+                maybeStartForegroundRefresh(activity);
+            }
+            @Override public void onActivityPaused(Activity activity) {}
+            @Override public void onActivitySaveInstanceState(Activity activity, Bundle outState) {}
+            @Override public void onActivityDestroyed(Activity activity) {}
+        });
+        log(Log.INFO, TAG, "foreground lifecycle callbacks installed");
+    }
+
+    private void maybeStartForegroundRefresh(Activity activity) {
+        if (!isRefreshEligibleActivity(activity)) {
+            return;
+        }
+        synchronized (LIFECYCLE_LOCK) {
+            if (foregroundRefreshStarted) {
+                return;
+            }
+            foregroundRefreshStarted = true;
+        }
+        log(Log.INFO, TAG, "Chaoxing entered foreground; start automatic refresh");
+        requestActiveRefresh("foregroundSession", false);
     }
 
     private void installJsonHooks() {
@@ -341,11 +412,11 @@ public final class ChaoxingHook extends XposedModule {
                         Object result = chain.proceed();
                         Object receiver = chain.getThisObject();
                         if (receiver instanceof Activity) {
-                            currentActivity = (Activity) receiver;
                             Activity activity = (Activity) receiver;
+                            currentActivityRef = new WeakReference<>(activity);
                             if (isLikelyHomeActivity(activity)) {
                                 lastHomeSeenAt = System.currentTimeMillis();
-                                maybeShowOverlay(activity);
+                                maybeShowOverlay(activity, true);
                             }
                         }
                         return result;
@@ -357,20 +428,28 @@ public final class ChaoxingHook extends XposedModule {
     }
 
     private void maybeShowOverlay(Activity activity) {
+        maybeShowOverlay(activity, true);
+    }
+
+    private void maybeShowOverlay(Activity activity, boolean requireHomeActivity) {
         if (activity == null || activity.isFinishing()) {
             return;
         }
-        long now = System.currentTimeMillis();
-        if (now - lastOverlayAt < 45L * 1000L) {
+        if (overlayDialogShowing || overlayScheduled) {
             return;
         }
-        if (now - lastHomeSeenAt > 8L * 1000L || !isLikelyHomeActivity(activity)) {
+        if (requireHomeActivity && !isLikelyHomeActivity(activity)) {
             log(Log.INFO, TAG, "overlay skipped: not on home activity");
             return;
         }
+        if (activeRefreshRunning) {
+            log(Log.INFO, TAG, "todo overlay uses cached data while active refresh continues");
+        }
+        overlayScheduled = true;
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            boolean shown = false;
             try {
-                if (activity.isFinishing() || !isLikelyHomeActivity(activity)) {
+                if (activity.isFinishing() || (requireHomeActivity && !isLikelyHomeActivity(activity))) {
                     return;
                 }
                 if (!overlayEnabled()) {
@@ -378,16 +457,31 @@ public final class ChaoxingHook extends XposedModule {
                     return;
                 }
                 List<OverlayTodo> todos = overlayTodos();
-                log(Log.INFO, TAG, "overlay todos=" + todos.size());
+                log(Log.INFO, TAG, "todo overlay todos=" + todos.size());
                 if (todos.isEmpty()) {
                     return;
                 }
-                lastOverlayAt = System.currentTimeMillis();
+                String fingerprint = overlayFingerprint(todos);
+                long now = System.currentTimeMillis();
+                if (fingerprint.equals(lastOverlayFingerprint)) {
+                    log(Log.INFO, TAG, "todo overlay skipped: unchanged");
+                    return;
+                }
+                overlayDialogShowing = true;
+                lastOverlayAt = now;
+                lastOverlayFingerprint = fingerprint;
                 AlertDialog dialog = new AlertDialog.Builder(activity)
-                        .setTitle("\u672a\u5b8c\u6210\u5f85\u529e")
                         .setView(overlayView(activity, todos))
                         .setPositiveButton("\u77e5\u9053\u4e86", null)
                         .show();
+                shown = true;
+                dialog.setOnDismissListener(d -> {
+                    overlayDialogShowing = false;
+                    if (overlayRetryAfterDialog) {
+                        overlayRetryAfterDialog = false;
+                        new Handler(Looper.getMainLooper()).postDelayed(() -> maybeShowOverlay(activity, false), 250L);
+                    }
+                });
                 Window window = dialog.getWindow();
                 if (window != null) {
                     int width = (int) (activity.getResources().getDisplayMetrics().widthPixels * 0.88f);
@@ -395,8 +489,27 @@ public final class ChaoxingHook extends XposedModule {
                 }
             } catch (Throwable throwable) {
                 log(Log.WARN, TAG, "show overlay failed: " + throwable);
+            } finally {
+                overlayScheduled = false;
+                if (!shown) {
+                    overlayDialogShowing = false;
+                }
             }
-        }, 1800L);
+        }, 800L);
+    }
+
+    private void maybeShowOverlayAfterRefresh() {
+        WeakReference<Activity> ref = currentActivityRef;
+        Activity activity = ref == null ? null : ref.get();
+        if (activity == null || activity.isFinishing()) {
+            return;
+        }
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            if (overlayDialogShowing || overlayScheduled) {
+                overlayRetryAfterDialog = true;
+            }
+            maybeShowOverlay(activity, false);
+        }, 900L);
     }
 
     private boolean overlayEnabled() {
@@ -410,130 +523,272 @@ public final class ChaoxingHook extends XposedModule {
     private List<OverlayTodo> overlayTodos() {
         ArrayList<OverlayTodo> todos = new ArrayList<>();
         long now = System.currentTimeMillis();
+        List<OverlayTodo> suppressed = new ArrayList<>();
         try {
-            String payload = getRemotePreferences(OverlayBridge.PREFS).getString(OverlayBridge.KEY_ITEMS, "[]");
+            SharedPreferences prefs = getRemotePreferences(OverlayBridge.PREFS);
+            String suppressedPayload = prefs.getString(OverlayBridge.KEY_SUPPRESSED, "[]");
+            JSONArray suppressedArray = new JSONArray(suppressedPayload == null ? "[]" : suppressedPayload);
+            for (int i = 0; i < suppressedArray.length(); i++) {
+                JSONObject json = suppressedArray.optJSONObject(i);
+                if (json == null) {
+                    continue;
+                }
+                suppressed.add(new OverlayTodo(
+                        json.optString("type", ""),
+                        json.optString("title", ""),
+                        "",
+                        json.optLong("dueAt", 0L)));
+            }
+
+            String payload = prefs.getString(OverlayBridge.KEY_ITEMS, "[]");
             JSONArray array = new JSONArray(payload == null ? "[]" : payload);
             for (int i = 0; i < array.length(); i++) {
                 JSONObject json = array.optJSONObject(i);
                 if (json == null) {
                     continue;
                 }
+                if (json.optBoolean("submitted", false)) {
+                    continue;
+                }
                 long dueAt = json.optLong("dueAt", 0L);
-                if (dueAt <= now) {
-                    continue;
-                }
                 String type = json.optString("type", "\u4e8b\u9879");
-                if (!"\u4f5c\u4e1a".equals(type) && !"\u8003\u8bd5".equals(type)) {
-                    continue;
-                }
-                todos.add(new OverlayTodo(
+                OverlayTodo todo = new OverlayTodo(
                         type,
                         json.optString("title", "\u672a\u547d\u540d"),
                         json.optString("course", ""),
-                        dueAt));
+                        dueAt);
+                if (!isSuppressedOverlayTodo(todo, suppressed)) {
+                    addOverlayTodo(todos, todo, now);
+                }
             }
         } catch (Throwable throwable) {
             log(Log.WARN, TAG, "read overlay prefs failed: " + throwable);
         }
-        if (!todos.isEmpty()) {
-            todos.sort((a, b) -> Long.compare(a.dueAt, b.dueAt));
-            return todos;
-        }
         synchronized (RECENT_ITEMS) {
-            for (DeadlineItem item : RECENT_ITEMS) {
-                if (item == null || item.dueAt <= now) {
+            for (int i = RECENT_ITEMS.size() - 1; i >= 0; i--) {
+                DeadlineItem item = RECENT_ITEMS.get(i);
+                if (item == null || item.submitted) {
+                    RECENT_ITEMS.remove(i);
                     continue;
                 }
-                if (!"\u4f5c\u4e1a".equals(item.type) && !"\u8003\u8bd5".equals(item.type)) {
+                OverlayTodo todo = new OverlayTodo(item.type, item.title, item.course, item.dueAt);
+                if (isSuppressedOverlayTodo(todo, suppressed)) {
+                    RECENT_ITEMS.remove(i);
                     continue;
                 }
-                todos.add(new OverlayTodo(item.type, item.title, item.course, item.dueAt));
+                addOverlayTodo(todos, todo, now);
             }
         }
         todos.sort((a, b) -> Long.compare(a.dueAt, b.dueAt));
         return todos;
     }
 
+    private boolean isSuppressedOverlayTodo(OverlayTodo todo, List<OverlayTodo> suppressed) {
+        if (todo == null || suppressed == null || suppressed.isEmpty()) {
+            return false;
+        }
+        for (OverlayTodo old : suppressed) {
+            if (isSameOverlayTodo(old, todo)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void addOverlayTodo(List<OverlayTodo> todos, OverlayTodo todo, long now) {
+        if (todo == null || !isUrgentDue(todo.dueAt, now)) {
+            return;
+        }
+        if (!"\u4f5c\u4e1a".equals(todo.type) && !"\u8003\u8bd5".equals(todo.type)) {
+            return;
+        }
+        for (int i = 0; i < todos.size(); i++) {
+            OverlayTodo old = todos.get(i);
+            if (!isSameOverlayTodo(old, todo)) {
+                continue;
+            }
+            todos.set(i, betterOverlayTodo(old, todo));
+            return;
+        }
+        todos.add(todo);
+    }
+
+    private boolean isSameOverlayTodo(OverlayTodo a, OverlayTodo b) {
+        if (a == null || b == null) {
+            return false;
+        }
+        if (!safe(a.type).equals(safe(b.type))) {
+            return false;
+        }
+        String titleA = normalizeOverlayText(a.title);
+        String titleB = normalizeOverlayText(b.title);
+        if (titleA.isEmpty() || !titleA.equals(titleB)) {
+            return false;
+        }
+        return Math.abs(a.dueAt - b.dueAt) <= 5L * 60L * 1000L;
+    }
+
+    private OverlayTodo betterOverlayTodo(OverlayTodo a, OverlayTodo b) {
+        String courseA = safe(a.course);
+        String courseB = safe(b.course);
+        String titleA = safe(a.title);
+        String titleB = safe(b.title);
+        String course = courseA.length() >= courseB.length() ? courseA : courseB;
+        String title = titleA.length() >= titleB.length() ? titleA : titleB;
+        long dueAt = Math.min(a.dueAt, b.dueAt);
+        return new OverlayTodo(safe(a.type).isEmpty() ? b.type : a.type, title, course, dueAt);
+    }
+
+    private boolean isUrgentDue(long dueAt, long now) {
+        return dueAt > now;
+    }
+
+    private String overlayFingerprint(List<OverlayTodo> todos) {
+        StringBuilder builder = new StringBuilder();
+        for (OverlayTodo todo : todos) {
+            if (todo == null) {
+                continue;
+            }
+            builder.append(overlayIdentity(todo)).append('|')
+                    .append(todo.dueAt / (5L * 60L * 1000L)).append('\n');
+        }
+        return builder.toString();
+    }
+
+    private String overlayIdentity(OverlayTodo todo) {
+        if (todo == null) {
+            return "";
+        }
+        return safe(todo.type) + "|" + normalizeOverlayText(todo.title);
+    }
+
+    private String normalizeOverlayText(String value) {
+        return safe(value).replaceAll("\\s+", "").toLowerCase(Locale.ROOT);
+    }
+
+    private String safe(String value) {
+        return value == null ? "" : value.trim();
+    }
+
     private View overlayView(Activity activity, List<OverlayTodo> todos) {
         LinearLayout root = new LinearLayout(activity);
         root.setOrientation(LinearLayout.VERTICAL);
-        int pad = dp(activity, 2);
-        root.setPadding(pad, 0, pad, 0);
+        root.setPadding(dp(activity, 20), dp(activity, 18), dp(activity, 20), dp(activity, 6));
+
+        TextView title = new TextView(activity);
+        title.setText("\u5b66\u4e60\u901a\u5f85\u529e");
+        title.setTextSize(20);
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setTextColor(Color.rgb(248, 250, 252));
+        root.addView(title, new LinearLayout.LayoutParams(-1, -2));
 
         TextView count = new TextView(activity);
-        count.setText("\u5171 " + todos.size() + " \u4e2a\u5f85\u529e\uff0c\u6309\u622a\u6b62\u65f6\u95f4\u6392\u5e8f");
+        count.setText("\u5171 " + todos.size() + " \u4e2a\u672a\u5b8c\u6210\u5f85\u529e");
         count.setTextSize(13);
-        count.setTextColor(Color.rgb(100, 116, 139));
-        count.setPadding(0, 0, 0, dp(activity, 8));
+        count.setTextColor(Color.rgb(148, 163, 184));
+        count.setPadding(0, dp(activity, 4), 0, dp(activity, 4));
         root.addView(count, new LinearLayout.LayoutParams(-1, -2));
+
+        TextView notice = new TextView(activity);
+        notice.setText("本次结果仅依据上次刷新得出的判断，无法判断最新待办，仅供参考");
+        notice.setTextSize(12);
+        notice.setTextColor(Color.rgb(96, 165, 250));
+        notice.setLineSpacing(0f, 1.12f);
+        notice.setPadding(0, 0, 0, dp(activity, 14));
+        root.addView(notice, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout list = new LinearLayout(activity);
         list.setOrientation(LinearLayout.VERTICAL);
         for (OverlayTodo todo : todos) {
-            list.addView(overlayRow(activity, todo), new LinearLayout.LayoutParams(-1, -2));
+            list.addView(overlayRow(activity, todo));
         }
 
         ScrollView scroll = new ScrollView(activity);
+        scroll.setFillViewport(false);
         scroll.addView(list, new ScrollView.LayoutParams(-1, -2));
-        int maxHeight = Math.min(dp(activity, 360), (int) (activity.getResources().getDisplayMetrics().heightPixels * 0.48f));
+        int maxHeight = Math.min(dp(activity, 380), (int) (activity.getResources().getDisplayMetrics().heightPixels * 0.52f));
         root.addView(scroll, new LinearLayout.LayoutParams(-1, maxHeight));
         return root;
     }
 
     private View overlayRow(Activity activity, OverlayTodo todo) {
-        LinearLayout row = new LinearLayout(activity);
-        row.setOrientation(LinearLayout.VERTICAL);
-        row.setPadding(dp(activity, 12), dp(activity, 10), dp(activity, 12), dp(activity, 10));
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(Color.argb(18, 99, 116, 139));
-        bg.setCornerRadius(dp(activity, 10));
-        row.setBackground(bg);
-
-        LinearLayout top = new LinearLayout(activity);
-        top.setOrientation(LinearLayout.HORIZONTAL);
-        top.setGravity(android.view.Gravity.CENTER_VERTICAL);
-
-        TextView badge = new TextView(activity);
-        badge.setText(todo.type);
-        badge.setTextSize(12);
-        badge.setTypeface(Typeface.DEFAULT_BOLD);
-        badge.setTextColor("\u8003\u8bd5".equals(todo.type) ? Color.rgb(214, 94, 34) : Color.rgb(59, 111, 240));
-        top.addView(badge, new LinearLayout.LayoutParams(-2, -2));
-
-        TextView due = new TextView(activity);
         long delta = todo.dueAt - System.currentTimeMillis();
         boolean urgent = delta <= 12L * 60L * 60L * 1000L;
-        due.setText(DateText.dueLine(todo.dueAt));
-        due.setTextSize(12);
-        due.setTextColor(urgent ? Color.rgb(220, 38, 38) : Color.rgb(71, 85, 105));
-        due.setGravity(android.view.Gravity.RIGHT | android.view.Gravity.CENTER_VERTICAL);
-        top.addView(due, new LinearLayout.LayoutParams(0, -2, 1f));
-        row.addView(top, new LinearLayout.LayoutParams(-1, -2));
+
+        LinearLayout row = new LinearLayout(activity);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(dp(activity, 14), dp(activity, 12), dp(activity, 14), dp(activity, 12));
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(urgent ? Color.rgb(64, 42, 42) : Color.rgb(38, 43, 55));
+        bg.setCornerRadius(dp(activity, 14));
+        bg.setStroke(dp(activity, 1), urgent ? Color.rgb(127, 55, 55) : Color.rgb(51, 65, 85));
+        row.setBackground(bg);
 
         TextView title = new TextView(activity);
         title.setText(todo.title == null || todo.title.isEmpty() ? "\u672a\u547d\u540d" : todo.title);
-        title.setTextSize(15);
+        title.setTextSize(16);
         title.setTypeface(Typeface.DEFAULT_BOLD);
-        title.setTextColor(urgent ? Color.rgb(185, 28, 28) : Color.rgb(15, 23, 42));
-        title.setPadding(0, dp(activity, 5), 0, 0);
+        title.setTextColor(Color.rgb(248, 250, 252));
+        title.setLineSpacing(0f, 1.08f);
         row.addView(title, new LinearLayout.LayoutParams(-1, -2));
 
         if (todo.course != null && !todo.course.isEmpty()) {
             TextView course = new TextView(activity);
             course.setText(todo.course);
-            course.setTextSize(12);
-            course.setTextColor(Color.rgb(100, 116, 139));
-            course.setPadding(0, dp(activity, 3), 0, 0);
+            course.setTextSize(13);
+            course.setTextColor(Color.rgb(148, 163, 184));
+            course.setPadding(0, dp(activity, 5), 0, 0);
             row.addView(course, new LinearLayout.LayoutParams(-1, -2));
         }
 
+        LinearLayout meta = new LinearLayout(activity);
+        meta.setOrientation(LinearLayout.HORIZONTAL);
+        meta.setGravity(android.view.Gravity.CENTER_VERTICAL);
+        meta.setPadding(0, dp(activity, 10), 0, 0);
+
+        TextView badge = new TextView(activity);
+        badge.setText(todo.type);
+        badge.setTextSize(12);
+        badge.setTypeface(Typeface.DEFAULT_BOLD);
+        badge.setTextColor("\u8003\u8bd5".equals(todo.type) ? Color.rgb(251, 146, 60) : Color.rgb(96, 165, 250));
+        GradientDrawable badgeBg = new GradientDrawable();
+        badgeBg.setColor("\u8003\u8bd5".equals(todo.type) ? Color.argb(40, 251, 146, 60) : Color.argb(40, 96, 165, 250));
+        badgeBg.setCornerRadius(dp(activity, 999));
+        badge.setBackground(badgeBg);
+        badge.setPadding(dp(activity, 8), dp(activity, 3), dp(activity, 8), dp(activity, 3));
+        meta.addView(badge, new LinearLayout.LayoutParams(-2, -2));
+
+        TextView due = new TextView(activity);
+        due.setText(DateText.dueLine(todo.dueAt));
+        due.setTextSize(13);
+        due.setTypeface(Typeface.DEFAULT_BOLD);
+        due.setTextColor(urgent ? Color.rgb(248, 113, 113) : Color.rgb(203, 213, 225));
+        due.setGravity(android.view.Gravity.END | android.view.Gravity.CENTER_VERTICAL);
+        due.setLineSpacing(0f, 1.05f);
+        LinearLayout.LayoutParams dueParams = new LinearLayout.LayoutParams(0, -2, 1f);
+        dueParams.setMargins(dp(activity, 12), 0, 0, 0);
+        meta.addView(due, dueParams);
+        row.addView(meta, new LinearLayout.LayoutParams(-1, -2));
+
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.setMargins(0, 0, 0, dp(activity, 8));
+        params.setMargins(0, 0, 0, dp(activity, 10));
         row.setLayoutParams(params);
         return row;
     }
 
+    private boolean isRefreshEligibleActivity(Activity activity) {
+        if (activity == null || activity.isFinishing()) {
+            return false;
+        }
+        String name = activity.getClass().getName().toLowerCase(Locale.ROOT);
+        return !(name.contains("splash") || name.contains("ad") || name.contains("advert")
+                || name.contains("welcome") || name.contains("guide") || name.contains("permission"));
+    }
+
     private boolean isLikelyHomeActivity(Activity activity) {
+        if (!isRefreshEligibleActivity(activity)) {
+            return false;
+        }
         String name = activity.getClass().getName().toLowerCase(Locale.ROOT);
         if (name.contains("splash") || name.contains("ad") || name.contains("advert")
                 || name.contains("welcome") || name.contains("guide") || name.contains("permission")) {
@@ -578,10 +833,16 @@ public final class ChaoxingHook extends XposedModule {
         if (!"\u4f5c\u4e1a".equals(item.type) && !"\u8003\u8bd5".equals(item.type)) {
             return;
         }
+        if (item.submitted || item.submissionState == DeadlineItem.SUBMISSION_UNKNOWN) {
+            return;
+        }
+        OverlayTodo current = new OverlayTodo(item.type, item.title, item.course, item.dueAt);
         synchronized (RECENT_ITEMS) {
+            long now = System.currentTimeMillis();
             for (int i = RECENT_ITEMS.size() - 1; i >= 0; i--) {
                 DeadlineItem old = RECENT_ITEMS.get(i);
-                if (old == null || item.id.equals(old.id) || old.dueAt <= System.currentTimeMillis()) {
+                if (old == null || item.id.equals(old.id) || old.dueAt <= now
+                        || isSameOverlayTodo(new OverlayTodo(old.type, old.title, old.course, old.dueAt), current)) {
                     RECENT_ITEMS.remove(i);
                 }
             }
@@ -590,8 +851,12 @@ public final class ChaoxingHook extends XposedModule {
                 RECENT_ITEMS.remove(RECENT_ITEMS.size() - 1);
             }
         }
-        Activity activity = currentActivity;
+        WeakReference<Activity> ref = currentActivityRef;
+        Activity activity = ref == null ? null : ref.get();
         if (activity != null) {
+            if (isUrgentDue(item.dueAt, System.currentTimeMillis()) && (overlayDialogShowing || overlayScheduled)) {
+                overlayRetryAfterDialog = true;
+            }
             maybeShowOverlay(activity);
         }
     }
@@ -606,20 +871,17 @@ public final class ChaoxingHook extends XposedModule {
             return;
         }
         collectAndFetchCourseTasks(text, ctx);
-        if (CHAPTER_TASKS_ENABLED) {
-            collectAndFetchChapterCards(text, ctx.source);
-        }
         PARSING.set(true);
         try {
             List<DeadlineItem> items = DeadlineParser.parsePayload(text, ctx);
             if (items.isEmpty()) {
                 return;
             }
-            log(Log.INFO, TAG, String.format(Locale.ROOT, BUILD_TAG + " found %d deadline items from %s", items.size(), ctx.source));
+            log(Log.INFO, TAG, String.format(Locale.ROOT, "hook v" + HOOK_VERSION + " found %d deadline items from %s", items.size(), ctx.source));
             for (DeadlineItem item : items) {
                 enrichCourseName(item);
                 rememberRecentItem(item);
-                log(Log.INFO, TAG, BUILD_TAG + " about to emit item from " + ctx.source);
+                log(Log.INFO, TAG, "emit parsed item from " + ctx.source);
                 emit(item);
             }
             emitStatus("captured " + items.size(), ctx.source);
@@ -629,6 +891,7 @@ public final class ChaoxingHook extends XposedModule {
             PARSING.set(false);
         }
     }
+
 
     private void enrichCourseName(DeadlineItem item) {
         if (item == null) {
@@ -655,17 +918,20 @@ public final class ChaoxingHook extends XposedModule {
         }
     }
 
-    private String courseNameFromSource(String source) {
-        if (source == null) {
-            return "";
-        }
-        int bar = source.indexOf('|');
-        return bar >= 0 && bar + 1 < source.length() ? source.substring(bar + 1).trim() : "";
-    }
-
     private String firstRegex(String text, String regex) {
         Matcher matcher = Pattern.compile(regex).matcher(text);
         return matcher.find() ? matcher.group(1) : "";
+    }
+
+    private String urlEncode(String value) {
+        if (value == null || value.isEmpty()) {
+            return "";
+        }
+        try {
+            return URLEncoder.encode(value, "UTF-8");
+        } catch (Throwable ignored) {
+            return value;
+        }
     }
 
     private void inspectBytes(byte[] bytes, String source) {
@@ -693,45 +959,48 @@ public final class ChaoxingHook extends XposedModule {
         inspect(url, ParseContext.fromSource(source, url));
     }
 
-    private void installCommandListener() {
-        if (commandListenerInstalled) {
-            return;
+    private void requestActiveRefresh(String reason, boolean force) {
+        long now = System.currentTimeMillis();
+        synchronized (LIFECYCLE_LOCK) {
+            if (!force && now - lastAutoRefreshAt < AUTO_REFRESH_MIN_GAP_MS) {
+                log(Log.INFO, TAG, "active refresh skipped by cooldown, remaining="
+                        + (AUTO_REFRESH_MIN_GAP_MS - (now - lastAutoRefreshAt)) + "ms reason=" + reason);
+                return;
+            }
+            if (activeRefreshRunning) {
+                log(Log.INFO, TAG, "active refresh skipped because another refresh is running, reason=" + reason);
+                return;
+            }
+            lastAutoRefreshAt = now;
+            activeRefreshRunning = true;
         }
-        try {
-            SharedPreferences prefs = getRemotePreferences("commands");
-            lastRefreshSeq = prefs.getLong("refresh_seq", 0L);
-            commandListener = (sharedPreferences, key) -> {
-                if (!"refresh_seq".equals(key)) {
-                    return;
-                }
-                long seq = sharedPreferences.getLong("refresh_seq", 0L);
-                if (seq > 0L && seq != lastRefreshSeq) {
-                    lastRefreshSeq = seq;
-                    activeRefresh("command");
-                }
-            };
-            prefs.registerOnSharedPreferenceChangeListener(commandListener);
-            commandListenerInstalled = true;
-            log(Log.INFO, TAG, "command listener installed");
-        } catch (Throwable throwable) {
-            log(Log.WARN, TAG, "command listener failed: " + throwable);
-        }
+        activeRefresh(reason);
     }
 
     private void activeRefresh(String reason) {
-        emitStatus("主动刷新中", reason);
+        log(Log.INFO, TAG, "active refresh start, reason=" + reason);
+        emitStatus("自动更新中", reason);
         Thread worker = new Thread(() -> {
+            boolean completed = false;
             try {
                 synchronized (FETCHED_URLS) {
                     FETCHED_URLS.clear();
                 }
-                fetchUrl("https://mooc1-api.chaoxing.com/mycourse/backclazzdata?view=json&rss=1", "active.courseList");
                 fetchUrl("https://mooc1-api.chaoxing.com/work/stu-work", "active.workPage");
                 fetchUrl("https://mooc1-api.chaoxing.com/exam-ans/exam/phone/examcode", "active.examPage");
-                emitStatus("主动刷新完成", reason);
+                fetchUrl("https://mooc1-api.chaoxing.com/mycourse/backclazzdata?view=json&rss=1", "active.courseList");
+                completed = true;
+                emitStatus("自动更新完成", reason);
             } catch (Throwable throwable) {
                 log(Log.WARN, TAG, "active refresh failed: " + throwable);
-                emitStatus("主动刷新失败：" + throwable.getClass().getSimpleName(), reason);
+                emitStatus("自动更新失败：" + throwable.getClass().getSimpleName(), reason);
+            } finally {
+                synchronized (LIFECYCLE_LOCK) {
+                    activeRefreshRunning = false;
+                }
+                if (completed) {
+                    maybeShowOverlayAfterRefresh();
+                }
             }
         }, "ChaoxingDeadlineRefresh");
         worker.setDaemon(true);
@@ -745,10 +1014,7 @@ public final class ChaoxingHook extends XposedModule {
     private void fetchUrl(String url, ParseContext context) {
         ParseContext ctx = context == null ? ParseContext.fromSource("", url) : context.withUrl(url);
         String source = ctx.source;
-        boolean guardedUrl = source != null && (source.startsWith("active.chapter") || source.startsWith("active.courseList"));
-        if (!CHAPTER_TASKS_ENABLED && source != null && source.startsWith("active.chapter")) {
-            return;
-        }
+        boolean guardedUrl = source != null && source.startsWith("active.courseList");
         if (guardedUrl && System.currentTimeMillis() < antiSpiderUntil) {
             log(Log.WARN, TAG, "skip active fetch while antispider cooldown is active");
             return;
@@ -835,154 +1101,70 @@ public final class ChaoxingHook extends XposedModule {
             Object root = trimmed.startsWith("[") ? new JSONArray(trimmed) : new JSONObject(trimmed);
             ArrayList<CourseRef> refs = new ArrayList<>();
             collectCourseRefs(root, refs, 0);
-            log(Log.INFO, TAG, "course refs from " + source + ": " + refs.size());
-            String cookieUid = uidFromCookies();
-            int total = refs.size();
-            if (total == 0) {
-                return;
-            }
             for (CourseRef ref : refs) {
                 rememberCourse(ref);
             }
-            int limit = Math.min(8, total);
-            int start = Math.floorMod(scanCursor, total);
-            scanCursor = (start + limit) % total;
-            for (int offset = 0; offset < limit; offset++) {
-                CourseRef ref = refs.get((start + offset) % total);
-                if (ref.courseId.isEmpty() || ref.classId.isEmpty()) {
-                    continue;
-                }
-                if (offset > 0) {
-                    Thread.sleep(1200L);
-                }
-                String refUid = ref.uid.isEmpty() ? cookieUid : ref.uid;
-                String uid = refUid.isEmpty() ? "" : "&uid=" + refUid;
-                String cpi = ref.cpi.isEmpty() ? "" : "&cpi=" + ref.cpi;
-                fetchUrl("https://mooc1-api.chaoxing.com/work/task-list?courseId="
-                        + ref.courseId + "&classId=" + ref.classId + cpi,
-                        parseContextForCourse("active.workList", ref, refUid));
-                fetchUrl("https://mobilelearn.chaoxing.com/ppt/activeAPI/taskactivelist?courseId="
-                        + ref.courseId + "&classId=" + ref.classId + uid,
-                        parseContextForCourse("active.taskList", ref, refUid));
-                fetchUrl("https://mooc1-api.chaoxing.com/mooc-ans/exam/phone/task-list?courseId="
-                        + ref.courseId + "&classId=" + ref.classId + cpi,
-                        parseContextForCourse("active.examList", ref, refUid));
-                if (CHAPTER_TASKS_ENABLED) {
-                    String personId = ref.cpi.isEmpty() ? refUid : ref.cpi;
-                    String fields = "id,name,course.fields(id,name,knowledge.fields(id,name,indexOrder,parentnodeid,status,isReview,layer,label,jobcount,begintime,endtime,jobUnfinishedCount))";
-                    fetchUrl("https://mooc1-api.chaoxing.com/gas/clazz?id=" + ref.classId
-                            + "&personid=" + personId + "&fields=" + urlEncode(fields) + "&view=json",
-                            parseContextForCourse("active.chapterList", ref, refUid));
-                }
-            }
+            log(Log.INFO, TAG, "course refs cached from " + source + ": " + refs.size());
+            fetchCourseDeadlines(refs);
         } catch (Throwable throwable) {
             log(Log.WARN, TAG, "collect course refs failed: " + throwable);
         }
     }
 
-    private void collectAndFetchChapterCards(String text, String source) {
-        if (source == null || !source.startsWith("active.chapterList") || source.startsWith("active.chapterCard")) {
+    private void fetchCourseDeadlines(List<CourseRef> refs) throws InterruptedException {
+        if (refs == null || refs.isEmpty()) {
             return;
         }
+        String cookieUid = uidFromCookies();
+        AtomicInteger submitted = new AtomicInteger();
+        AtomicInteger scanned = new AtomicInteger();
+        ExecutorService executor = Executors.newFixedThreadPool(COURSE_FETCH_THREADS, runnable -> {
+            Thread thread = new Thread(runnable, "ChaoxingDeadlineCourseScan");
+            thread.setDaemon(true);
+            return thread;
+        });
         try {
-            String trimmed = text.trim();
-            Object root = trimmed.startsWith("[") ? new JSONArray(trimmed) : new JSONObject(trimmed);
-            ArrayList<ChapterRef> refs = new ArrayList<>();
-            collectChapterRefs(root, refs, "", "", 0);
-            log(Log.INFO, TAG, "chapter card refs from " + source + ": " + refs.size());
-            int fetched = 0;
-            for (ChapterRef ref : refs) {
-                if (ref.courseId.isEmpty() || ref.knowledgeId.isEmpty()) {
+            for (CourseRef ref : refs) {
+                if (ref == null || ref.courseId.isEmpty() || ref.classId.isEmpty()) {
                     continue;
                 }
-                if (fetched >= 5) {
-                    break;
-                }
-                fetched++;
-                String fields = "id,parentnodeid,indexorder,label,layer,name,begintime,createtime,lastmodifytime,status,jobUnfinishedCount,clickcount,openlock,card.fields(id,knowledgeid,title,knowledgeTitile,description,cardorder).contentcard(all)";
-                fetchUrl("https://mooc1-api.chaoxing.com/gas/knowledge?id=" + ref.knowledgeId
-                        + "&courseid=" + ref.courseId
-                        + "&fields=" + urlEncode(fields)
-                        + "&view=json&_time=" + System.currentTimeMillis(),
-                        sourceForChapterCard(source, ref));
-            }
-        } catch (Throwable throwable) {
-            log(Log.WARN, TAG, "collect chapter card refs failed: " + throwable);
-        }
-    }
-
-    private void collectChapterRefs(Object node, List<ChapterRef> out, String courseId, String courseName, int depth) throws Exception {
-        if (node == null || depth > 14 || out.size() > 120) {
-            return;
-        }
-        if (node instanceof JSONObject) {
-            JSONObject object = (JSONObject) node;
-            String nextCourseId = courseId;
-            String nextCourseName = courseName;
-            if (object.has("course") && object.opt("course") instanceof JSONObject) {
-                JSONObject course = object.optJSONObject("course");
-                JSONObject courseData = firstDataObject(course);
-                if (courseData != null) {
-                    String id = firstString(courseData, "id", "courseid", "courseId");
-                    String name = firstString(courseData, "name", "courseName", "coursename");
-                    if (!id.isEmpty()) {
-                        nextCourseId = id;
+                int index = submitted.incrementAndGet();
+                executor.execute(() -> {
+                    try {
+                        Thread.sleep((long) (index % COURSE_FETCH_THREADS) * 160L);
+                        fetchCourseDeadline(ref, cookieUid);
+                        scanned.incrementAndGet();
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    } catch (Throwable throwable) {
+                        log(Log.WARN, TAG, "course deadline fetch failed: " + throwable.getClass().getSimpleName());
                     }
-                    if (!name.isEmpty()) {
-                        nextCourseName = name;
-                    }
-                }
+                });
             }
-            if (isKnowledgeTaskNode(object)) {
-                String knowledgeId = firstString(object, "id", "knowledgeId", "chapterId");
-                if (!knowledgeId.isEmpty() && !nextCourseId.isEmpty()) {
-                    out.add(new ChapterRef(nextCourseId, knowledgeId, nextCourseName, firstString(object, "name", "title")));
-                }
-            }
-            Iterator<String> keys = object.keys();
-            while (keys.hasNext()) {
-                Object child = object.opt(keys.next());
-                if (child instanceof JSONObject || child instanceof JSONArray) {
-                    collectChapterRefs(child, out, nextCourseId, nextCourseName, depth + 1);
-                }
-            }
-            return;
+        } finally {
+            executor.shutdown();
         }
-        if (node instanceof JSONArray) {
-            JSONArray array = (JSONArray) node;
-            for (int i = 0; i < array.length(); i++) {
-                Object child = array.opt(i);
-                if (child instanceof JSONObject || child instanceof JSONArray) {
-                    collectChapterRefs(child, out, courseId, courseName, depth + 1);
-                }
-            }
+        if (!executor.awaitTermination(90L, TimeUnit.SECONDS)) {
+            executor.shutdownNow();
+            log(Log.WARN, TAG, "course deadline scan timeout: " + scanned.get() + "/" + submitted.get());
         }
+        log(Log.INFO, TAG, "course deadline scan complete: " + scanned.get() + "/" + submitted.get()
+                + " courses, threads=" + COURSE_FETCH_THREADS);
     }
 
-    private boolean isKnowledgeTaskNode(JSONObject object) {
-        int jobCount = object.optInt("jobcount", 0);
-        int unfinished = object.optInt("jobUnfinishedCount", 0);
-        if (jobCount <= 0 && unfinished <= 0) {
-            return false;
-        }
-        return object.has("label") || object.has("parentnodeid") || object.has("layer") || object.has("indexorder");
-    }
-
-    private JSONObject firstDataObject(JSONObject wrapper) {
-        if (wrapper == null) {
-            return null;
-        }
-        JSONArray data = wrapper.optJSONArray("data");
-        if (data != null && data.length() > 0) {
-            return data.optJSONObject(0);
-        }
-        return wrapper;
-    }
-
-    private String sourceForChapterCard(String source, ChapterRef ref) {
-        String course = ref.courseName.isEmpty() ? courseNameFromSource(source) : ref.courseName;
-        String title = ref.chapterTitle.isEmpty() ? ref.knowledgeId : ref.chapterTitle;
-        return "active.chapterCard|" + course + "|" + title;
+    private void fetchCourseDeadline(CourseRef ref, String cookieUid) {
+        String refUid = ref.uid.isEmpty() ? cookieUid : ref.uid;
+        String uid = refUid.isEmpty() ? "" : "&uid=" + urlEncode(refUid);
+        String cpi = ref.cpi.isEmpty() ? "" : "&cpi=" + urlEncode(ref.cpi);
+        fetchUrl("https://mooc1-api.chaoxing.com/work/task-list?courseId="
+                        + urlEncode(ref.courseId) + "&classId=" + urlEncode(ref.classId) + cpi,
+                parseContextForCourse("active.workList", ref, refUid));
+        fetchUrl("https://mobilelearn.chaoxing.com/ppt/activeAPI/taskactivelist?courseId="
+                        + urlEncode(ref.courseId) + "&classId=" + urlEncode(ref.classId) + uid,
+                parseContextForCourse("active.taskList", ref, refUid));
+        fetchUrl("https://mooc1-api.chaoxing.com/mooc-ans/exam/phone/task-list?courseId="
+                        + urlEncode(ref.courseId) + "&classId=" + urlEncode(ref.classId) + cpi,
+                parseContextForCourse("active.examList", ref, refUid));
     }
 
     private void rememberCourse(CourseRef ref) {
@@ -1010,6 +1192,7 @@ public final class ChaoxingHook extends XposedModule {
             intent.putExtra("class_id", ref.classId);
             intent.putExtra("cpi", ref.cpi);
             intent.putExtra("uid", ref.uid);
+            intent.putExtra("raw", ref.raw);
             attachBridgeToken(intent);
             context.sendBroadcast(intent);
         } catch (Throwable throwable) {
@@ -1023,13 +1206,6 @@ public final class ChaoxingHook extends XposedModule {
         }
         String uid = ref.uid.isEmpty() ? fallbackUid : ref.uid;
         return ParseContext.forCourse(prefix, "", ref.courseId, ref.classId, ref.cpi, uid, ref.courseName);
-    }
-
-    private String sourceForCourse(String prefix, CourseRef ref) {
-        if (ref.courseName.isEmpty()) {
-            return prefix;
-        }
-        return prefix + "|" + ref.courseName + "|" + ref.courseId + "|" + ref.classId + "|" + ref.cpi + "|" + ref.uid;
     }
 
     private String uidFromCookies() {
@@ -1074,14 +1250,6 @@ public final class ChaoxingHook extends XposedModule {
         return "";
     }
 
-    private String urlEncode(String value) {
-        try {
-            return URLEncoder.encode(value, "UTF-8");
-        } catch (Throwable ignored) {
-            return value;
-        }
-    }
-
     private void collectCourseRefs(Object node, List<CourseRef> out, int depth) throws Exception {
         if (node == null || depth > 12 || out.size() > 80) {
             return;
@@ -1101,9 +1269,9 @@ public final class ChaoxingHook extends XposedModule {
             String cpi = firstString(object, "cpi", "cpiId");
             String courseName = firstString(object, "courseName", "coursename", "name", "title", "clazzName", "className");
             if (!courseId.isEmpty() && !classId.isEmpty()) {
-                out.add(new CourseRef(courseId, classId, uid, cpi, courseName));
+                out.add(new CourseRef(courseId, classId, uid, cpi, courseName, object.toString()));
             }
-            java.util.Iterator<String> keys = object.keys();
+            Iterator<String> keys = object.keys();
             while (keys.hasNext()) {
                 Object child = object.opt(keys.next());
                 if (child instanceof JSONObject || child instanceof JSONArray) {
@@ -1147,7 +1315,7 @@ public final class ChaoxingHook extends XposedModule {
         if (courseId.isEmpty() || classId.isEmpty()) {
             return null;
         }
-        return new CourseRef(courseId, classId, uid, cpi, courseName);
+        return new CourseRef(courseId, classId, uid, cpi, courseName, content.toString());
     }
 
     private String firstString(JSONObject object, String... keys) {
@@ -1203,6 +1371,7 @@ public final class ChaoxingHook extends XposedModule {
         }
     }
 
+    @SuppressLint("ApplySharedPref")
     private void attachBridgeToken(Intent intent) {
         try {
             SharedPreferences prefs = getRemotePreferences(BridgeAuth.PREFS_NAME);
@@ -1231,7 +1400,7 @@ public final class ChaoxingHook extends XposedModule {
             Object app = currentApplication.invoke(null);
             if (app instanceof Application) {
                 hostContext = ((Application) app).getApplicationContext();
-                log(Log.INFO, TAG, BUILD_TAG + " host context recovered from currentApplication");
+                log(Log.INFO, TAG, "host context recovered from currentApplication");
                 flushPending();
                 return hostContext;
             }
@@ -1243,7 +1412,7 @@ public final class ChaoxingHook extends XposedModule {
                 app = initialApplication.get(thread);
                 if (app instanceof Application) {
                     hostContext = ((Application) app).getApplicationContext();
-                    log(Log.INFO, TAG, BUILD_TAG + " host context recovered from ActivityThread");
+                    log(Log.INFO, TAG, "host context recovered from ActivityThread");
                     flushPending();
                     return hostContext;
                 }
@@ -1271,27 +1440,20 @@ public final class ChaoxingHook extends XposedModule {
         final String uid;
         final String cpi;
         final String courseName;
+        final String raw;
 
         CourseRef(String courseId, String classId, String uid, String cpi, String courseName) {
+            this(courseId, classId, uid, cpi, courseName, "");
+        }
+
+        CourseRef(String courseId, String classId, String uid, String cpi, String courseName, String raw) {
             this.courseId = courseId == null ? "" : courseId;
             this.classId = classId == null ? "" : classId;
             this.uid = uid == null ? "" : uid;
             this.cpi = cpi == null ? "" : cpi;
             this.courseName = courseName == null ? "" : courseName;
+            this.raw = raw == null ? "" : raw;
         }
     }
 
-    private static final class ChapterRef {
-        final String courseId;
-        final String knowledgeId;
-        final String courseName;
-        final String chapterTitle;
-
-        ChapterRef(String courseId, String knowledgeId, String courseName, String chapterTitle) {
-            this.courseId = courseId == null ? "" : courseId;
-            this.knowledgeId = knowledgeId == null ? "" : knowledgeId;
-            this.courseName = courseName == null ? "" : courseName;
-            this.chapterTitle = chapterTitle == null ? "" : chapterTitle;
-        }
-    }
 }

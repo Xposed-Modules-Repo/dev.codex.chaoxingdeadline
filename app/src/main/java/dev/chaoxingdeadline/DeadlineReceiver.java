@@ -14,6 +14,8 @@ public final class DeadlineReceiver extends BroadcastReceiver {
     public static final String ACTION_REFRESH = "dev.chaoxingdeadline.REFRESH";
     public static final String ACTION_CHECK = "dev.chaoxingdeadline.CHECK";
     public static final String ACTION_NOTIFY = "dev.chaoxingdeadline.NOTIFY";
+    public static final String ACTION_IGNORE = "dev.chaoxingdeadline.IGNORE";
+    public static final String ACTION_DELETE = "dev.chaoxingdeadline.DELETE";
     public static final String ACTION_COURSE = "dev.chaoxingdeadline.COURSE";
     public static final String EXTRA_ITEM_B64 = "item_b64";
     public static final String EXTRA_STATUS = "status";
@@ -49,12 +51,24 @@ public final class DeadlineReceiver extends BroadcastReceiver {
             return;
         }
         if (ACTION_NOTIFY.equals(intent.getAction())) {
-            DeadlineNotifier.notifyDue(context, intent.getStringExtra("deadline_id"));
+            DeadlineNotifier.notifyDue(context,
+                    intent.getStringExtra(DeadlineNotifier.EXTRA_DEADLINE_ID),
+                    intent.getLongExtra(DeadlineNotifier.EXTRA_OFFSET_MILLIS, 0L));
             OverlayBridge.publish(context);
             return;
         }
+        if (ACTION_IGNORE.equals(intent.getAction())) {
+            DeadlineNotifier.ignoreItem(context, intent.getStringExtra(DeadlineNotifier.EXTRA_DEADLINE_ID));
+            OverlayBridge.publish(context);
+            return;
+        }
+        if (ACTION_DELETE.equals(intent.getAction())) {
+            DeadlineNotifier.deleteItem(context, intent.getStringExtra(DeadlineNotifier.EXTRA_DEADLINE_ID));
+            return;
+        }
         if (ACTION_COURSE.equals(intent.getAction())) {
-            new DeadlineStore(context).rememberCourse(
+            DeadlineStore store = new DeadlineStore(context);
+            store.rememberCourse(
                     intent.getStringExtra("course_id"),
                     intent.getStringExtra("class_id"),
                     intent.getStringExtra("cpi"),
@@ -74,7 +88,6 @@ public final class DeadlineReceiver extends BroadcastReceiver {
                 return;
             }
             String payload = new String(Base64.getDecoder().decode(encoded), StandardCharsets.UTF_8);
-            Log.i(TAG, "Received deadline payload: " + payload);
             DeadlineItem item = DeadlineItem.fromJson(payload);
             DeadlineStore store = new DeadlineStore(context);
             store.resolveCourse(item);
@@ -87,7 +100,7 @@ public final class DeadlineReceiver extends BroadcastReceiver {
                     .putLong("last_capture_at", System.currentTimeMillis())
                     .putString("last_capture_source", item.source)
                     .apply();
-            Log.i(TAG, "Stored deadline: " + item.title + " @ " + item.dueAt);
+            Log.i(TAG, "Stored deadline from " + item.source + ": " + item.title + " @ " + item.dueAt);
             DeadlineNotifier.rescheduleAll(context);
             OverlayBridge.publish(context);
             context.sendBroadcast(new Intent(ACTION_REFRESH).setPackage(context.getPackageName()));

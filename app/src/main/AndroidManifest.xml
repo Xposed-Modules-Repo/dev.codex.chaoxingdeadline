@@ -45,15 +45,14 @@
         <activity
             android:name=".AboutActivity"
             android:exported="false" />
+        <!-- Exported intentionally: the hook runs inside Chaoxing's process and sends explicit
+             broadcasts back to this module. DeadlineReceiver validates every non-system action
+             with BridgeAuth before accepting data. -->
         <receiver
             android:name=".DeadlineReceiver"
-            android:exported="true">
+            android:exported="true"
+            tools:ignore="ExportedReceiver">
             <intent-filter>
-                <action android:name="dev.chaoxingdeadline.DEADLINE_ITEM" />
-                <action android:name="dev.chaoxingdeadline.STATUS" />
-                <action android:name="dev.chaoxingdeadline.CHECK" />
-                <action android:name="dev.chaoxingdeadline.NOTIFY" />
-                <action android:name="dev.chaoxingdeadline.COURSE" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>

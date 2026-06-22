@@ -15,8 +15,10 @@ import java.util.Set;
 
 public final class DeadlineStore extends SQLiteOpenHelper {
     private static final String DB_NAME = "deadlines.db";
-    private static final int DB_VERSION = 3;
+    private static final int DB_VERSION = 4;
     private static final String PREFS = "blocked_courses";
+    private static final String KEY_LEGACY_COURSES = "courses";
+    private static final String KEY_BLOCKED_RULES = "rules";
     private final Context context;
 
     public DeadlineStore(Context context) {
@@ -39,6 +41,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
                 + "course_confidence INTEGER NOT NULL DEFAULT 0,"
                 + "due_at INTEGER NOT NULL,"
                 + "submitted INTEGER NOT NULL DEFAULT 0,"
+                + "submit_state INTEGER NOT NULL DEFAULT -1,"
                 + "source TEXT,"
                 + "url TEXT,"
                 + "updated_at INTEGER NOT NULL,"
@@ -65,6 +68,13 @@ public final class DeadlineStore extends SQLiteOpenHelper {
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_deadlines_course_ref ON deadlines(course_id, class_id)");
             db.execSQL("CREATE INDEX IF NOT EXISTS idx_deadlines_task_ref ON deadlines(type, course_id, class_id, task_id)");
             migrateCourseTable(db);
+        }
+        if (oldVersion < 4) {
+            addColumn(db, "deadlines", "submit_state", "INTEGER NOT NULL DEFAULT -1");
+            try {
+                db.execSQL("UPDATE deadlines SET submit_state = 1 WHERE submitted != 0");
+            } catch (Throwable ignored) {
+            }
         }
     }
 
@@ -128,12 +138,11 @@ public final class DeadlineStore extends SQLiteOpenHelper {
             item.id = item.stableId();
         }
         SQLiteDatabase db = getWritableDatabase();
+        preserveSubmissionState(db, item);
         db.replace("deadlines", null, item.toValues());
         deleteLikelyDuplicates(db, item);
         if (AppSettings.autoDeleteExpired(context)) {
             prune();
-        } else {
-            getWritableDatabase().delete("deadlines", "submitted != 0", null);
         }
     }
 
@@ -246,6 +255,38 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         db.update("deadlines", values, where, args);
     }
 
+    private void preserveSubmissionState(SQLiteDatabase db, DeadlineItem item) {
+        if (item == null || item.submissionState != DeadlineItem.SUBMISSION_UNKNOWN
+                || item.id == null || item.id.isEmpty()) {
+            return;
+        }
+        if (hasSubmittedMatch(db, "id = ?", new String[]{item.id})) {
+            item.setSubmissionState(DeadlineItem.SUBMISSION_SUBMITTED);
+            return;
+        }
+        if (!empty(item.taskId) && !empty(item.courseId)) {
+            if (hasSubmittedMatch(db,
+                    "type = ? AND course_id = ? AND class_id = ? AND task_id = ?",
+                    new String[]{item.type, item.courseId, item.classId == null ? "" : item.classId, item.taskId})) {
+                item.setSubmissionState(DeadlineItem.SUBMISSION_SUBMITTED);
+                return;
+            }
+        }
+        long window = "考试".equals(item.type) ? 6L * 60L * 60L * 1000L : 30L * 60L * 1000L;
+        if (!empty(item.title) && hasSubmittedMatch(db,
+                "type = ? AND title = ? AND ABS(due_at - ?) <= ?",
+                new String[]{item.type, item.title, String.valueOf(item.dueAt), String.valueOf(window)})) {
+            item.setSubmissionState(DeadlineItem.SUBMISSION_SUBMITTED);
+        }
+    }
+
+    private boolean hasSubmittedMatch(SQLiteDatabase db, String where, String[] args) {
+        try (Cursor cursor = db.query("deadlines", new String[]{"id"},
+                "submitted != 0 AND " + where, args, null, null, null, "1")) {
+            return cursor.moveToFirst();
+        }
+    }
+
     private void deleteLikelyDuplicates(SQLiteDatabase db, DeadlineItem item) {
         if (item.type == null || item.title == null || item.id == null) {
             return;
@@ -277,7 +318,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
         if (AppSettings.autoDeleteExpired(context)) {
             prune();
         }
-        String where = AppSettings.autoDeleteExpired(context) ? "due_at > ? AND submitted = 0" : "submitted = 0";
+        String where = AppSettings.autoDeleteExpired(context) ? "due_at > ?" : null;
         String[] args = AppSettings.autoDeleteExpired(context)
                 ? new String[]{String.valueOf(System.currentTimeMillis())}
                 : null;
@@ -331,25 +372,35 @@ public final class DeadlineStore extends SQLiteOpenHelper {
     }
 
     public void blockCourseType(String course, String type, boolean blocked) {
+        setCourseTypeEnabled(course, type, !blocked);
+    }
+
+    public void setCourseTypeEnabled(String course, String type, boolean enabled) {
         if (course == null || course.trim().isEmpty()) {
             return;
         }
         String key = blockKey(course, type);
         Set<String> blockedRules = new HashSet<>(blockedRules());
-        if (blocked) {
-            blockedRules.add(key);
-        } else {
+        if (enabled) {
             blockedRules.remove(key);
+        } else {
+            blockedRules.add(key);
         }
-        prefs().edit().putStringSet("rules", blockedRules).apply();
+        prefs().edit()
+                .putStringSet(KEY_BLOCKED_RULES, blockedRules)
+                .apply();
     }
 
+
     public void clearBlockedCourses() {
-        prefs().edit().remove("courses").remove("rules").apply();
+        prefs().edit()
+                .remove(KEY_LEGACY_COURSES)
+                .remove(KEY_BLOCKED_RULES)
+                .apply();
     }
 
     public Set<String> blockedCourses() {
-        Set<String> result = new HashSet<>(prefs().getStringSet("courses", new HashSet<>()));
+        Set<String> result = new HashSet<>(prefs().getStringSet(KEY_LEGACY_COURSES, new HashSet<>()));
         for (String rule : blockedRules()) {
             int bar = rule.lastIndexOf('|');
             if (bar > 0) {
@@ -364,19 +415,35 @@ public final class DeadlineStore extends SQLiteOpenHelper {
     }
 
     public boolean isBlocked(String course, String type) {
+        return !isCourseTypeEnabled(course, type);
+    }
+
+    public boolean isCourseTypeEnabled(String course, String type) {
         if (course == null || course.trim().isEmpty()) {
-            return false;
-        }
-        Set<String> oldCourses = prefs().getStringSet("courses", new HashSet<>());
-        if (oldCourses.contains(course.trim())) {
             return true;
         }
-        Set<String> rules = blockedRules();
-        return rules.contains(blockKey(course, "全部")) || rules.contains(blockKey(course, type));
+        String cleanCourse = course.trim();
+        Set<String> legacyCourses = prefs().getStringSet(KEY_LEGACY_COURSES, new HashSet<>());
+        if (legacyCourses.contains(cleanCourse)) {
+            return false;
+        }
+        Set<String> blocked = blockedRules();
+        if (blocked.contains(blockKey(cleanCourse, "全部")) || blocked.contains(blockKey(cleanCourse, type))) {
+            return false;
+        }
+        return true;
     }
 
     public List<String> knownCourses() {
         HashSet<String> courses = new HashSet<>(blockedCourses());
+        courses.addAll(knownCoursesFromDb());
+        ArrayList<String> result = new ArrayList<>(courses);
+        Collections.sort(result);
+        return result;
+    }
+
+    private Set<String> knownCoursesFromDb() {
+        HashSet<String> courses = new HashSet<>();
         try (Cursor cursor = getReadableDatabase().query("courses", new String[]{"name"},
                 "name IS NOT NULL AND name <> ''", null, "name", null, "name ASC")) {
             while (cursor.moveToNext()) {
@@ -389,9 +456,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
                 courses.add(cursor.getString(0));
             }
         }
-        ArrayList<String> result = new ArrayList<>(courses);
-        Collections.sort(result);
-        return result;
+        return courses;
     }
 
     private String blockKey(String course, String type) {
@@ -400,7 +465,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
     }
 
     private Set<String> blockedRules() {
-        return new HashSet<>(prefs().getStringSet("rules", new HashSet<>()));
+        return new HashSet<>(prefs().getStringSet(KEY_BLOCKED_RULES, new HashSet<>()));
     }
 
     private SharedPreferences prefs() {
@@ -409,7 +474,7 @@ public final class DeadlineStore extends SQLiteOpenHelper {
 
     public void prune() {
         long now = System.currentTimeMillis();
-        getWritableDatabase().delete("deadlines", "due_at <= ? OR submitted != 0", new String[]{String.valueOf(now)});
+        getWritableDatabase().delete("deadlines", "due_at <= ?", new String[]{String.valueOf(now)});
     }
 
     private static boolean empty(String value) {

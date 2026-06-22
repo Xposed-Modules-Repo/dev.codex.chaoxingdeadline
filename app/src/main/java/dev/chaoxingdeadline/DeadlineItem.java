@@ -9,6 +9,10 @@ import org.json.JSONObject;
 import java.util.Locale;
 
 public final class DeadlineItem {
+    public static final int SUBMISSION_UNKNOWN = -1;
+    public static final int SUBMISSION_UNSUBMITTED = 0;
+    public static final int SUBMISSION_SUBMITTED = 1;
+
     public String id;
     public String type;
     public String title;
@@ -21,6 +25,7 @@ public final class DeadlineItem {
     public int courseConfidence;
     public long dueAt;
     public boolean submitted;
+    public int submissionState = SUBMISSION_UNKNOWN;
     public String source;
     public String url;
     public String raw;
@@ -38,7 +43,10 @@ public final class DeadlineItem {
         values.put("task_id", taskId);
         values.put("course_confidence", courseConfidence);
         values.put("due_at", dueAt);
+        int storedSubmissionState = submitted && submissionState == SUBMISSION_UNKNOWN
+                ? SUBMISSION_SUBMITTED : submissionState;
         values.put("submitted", submitted ? 1 : 0);
+        values.put("submit_state", storedSubmissionState);
         values.put("source", source);
         values.put("url", url);
         values.put("updated_at", System.currentTimeMillis());
@@ -60,6 +68,7 @@ public final class DeadlineItem {
         json.put("courseConfidence", courseConfidence);
         json.put("dueAt", dueAt);
         json.put("submitted", submitted);
+        json.put("submitState", submissionState);
         json.put("source", source);
         json.put("url", url);
         json.put("raw", raw);
@@ -80,7 +89,11 @@ public final class DeadlineItem {
         item.taskId = json.optString("taskId", "");
         item.courseConfidence = json.optInt("courseConfidence", item.course == null || item.course.isEmpty() ? 0 : 60);
         item.dueAt = json.optLong("dueAt", 0L);
-        item.submitted = json.optBoolean("submitted", false);
+        if (json.has("submitState")) {
+            item.setSubmissionState(json.optInt("submitState", SUBMISSION_UNKNOWN));
+        } else if (json.optBoolean("submitted", false)) {
+            item.setSubmissionState(SUBMISSION_SUBMITTED);
+        }
         item.source = json.optString("source", "");
         item.url = json.optString("url", "");
         item.raw = json.optString("raw", "");
@@ -101,6 +114,8 @@ public final class DeadlineItem {
         item.courseConfidence = intOrZero(cursor, "course_confidence");
         item.dueAt = cursor.getLong(cursor.getColumnIndexOrThrow("due_at"));
         item.submitted = cursor.getInt(cursor.getColumnIndexOrThrow("submitted")) != 0;
+        item.setSubmissionState(intOrDefault(cursor, "submit_state",
+                item.submitted ? SUBMISSION_SUBMITTED : SUBMISSION_UNKNOWN));
         item.source = stringOrEmpty(cursor, "source");
         item.url = stringOrEmpty(cursor, "url");
         item.raw = stringOrEmpty(cursor, "raw");
@@ -143,11 +158,23 @@ public final class DeadlineItem {
     }
 
     private static int intOrZero(Cursor cursor, String column) {
+        return intOrDefault(cursor, column, 0);
+    }
+
+    private static int intOrDefault(Cursor cursor, String column, int fallback) {
         int index = cursor.getColumnIndex(column);
         if (index < 0 || cursor.isNull(index)) {
-            return 0;
+            return fallback;
         }
         return cursor.getInt(index);
+    }
+
+    public void setSubmissionState(int state) {
+        if (state < SUBMISSION_UNKNOWN || state > SUBMISSION_SUBMITTED) {
+            state = SUBMISSION_UNKNOWN;
+        }
+        submissionState = state;
+        submitted = state == SUBMISSION_SUBMITTED;
     }
 
     private static boolean empty(String value) {

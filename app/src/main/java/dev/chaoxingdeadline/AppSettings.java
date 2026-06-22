@@ -5,6 +5,9 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 
+import java.util.LinkedHashSet;
+import java.util.concurrent.TimeUnit;
+
 public final class AppSettings {
     public static final String PREFS = "app_settings";
     public static final String LAUNCHER_ALIAS = "dev.chaoxingdeadline.LauncherActivity";
@@ -16,7 +19,7 @@ public final class AppSettings {
         return context.getApplicationContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     }
 
-    public static boolean notificationsEnabled(Context context) {
+    public static boolean finalReminderEnabled(Context context) {
         return prefs(context).getBoolean("notify_enabled", true);
     }
 
@@ -32,17 +35,50 @@ public final class AppSettings {
         return Math.max(1, Math.min(168, prefs(context).getInt("notify_hours", 24)));
     }
 
+    public static long[] notifyOffsetsMillis(Context context) {
+        long main = TimeUnit.HOURS.toMillis(notifyHours(context));
+        LinkedHashSet<Long> offsets = new LinkedHashSet<>();
+        offsets.add(main);
+        if (finalReminderEnabled(context)) {
+            long threeHours = TimeUnit.HOURS.toMillis(3);
+            long thirtyMinutes = TimeUnit.MINUTES.toMillis(30);
+            if (main > threeHours) {
+                offsets.add(threeHours);
+            }
+            if (main > thirtyMinutes) {
+                offsets.add(thirtyMinutes);
+            }
+        }
+        long[] result = new long[offsets.size()];
+        int index = 0;
+        for (Long offset : offsets) {
+            if (offset != null && offset > 0L) {
+                result[index++] = offset;
+            }
+        }
+        if (index == result.length) {
+            return result;
+        }
+        long[] compact = new long[index];
+        System.arraycopy(result, 0, compact, 0, index);
+        return compact;
+    }
+
     public static boolean overlayEnabled(Context context) {
         return prefs(context).getBoolean("overlay_enabled", true);
     }
 
     public static void setOverlayEnabled(Context context, boolean enabled) {
         prefs(context).edit().putBoolean("overlay_enabled", enabled).apply();
+        syncRemotePreferences(context);
+    }
+
+    public static void syncRemotePreferences(Context context) {
         try {
             if (App.getService() != null) {
-                App.getService().getRemotePreferences("app_settings")
+                App.getService().getRemotePreferences(PREFS)
                         .edit()
-                        .putBoolean("overlay_enabled", enabled)
+                        .putBoolean("overlay_enabled", overlayEnabled(context))
                         .apply();
             }
         } catch (Throwable ignored) {
@@ -89,9 +125,6 @@ public final class AppSettings {
     }
 
     public static boolean shouldNotifyType(Context context, String type) {
-        if (!notificationsEnabled(context)) {
-            return false;
-        }
         if ("\u4f5c\u4e1a".equals(type)) {
             return notifyHomework(context);
         }
