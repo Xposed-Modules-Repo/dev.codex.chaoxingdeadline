@@ -1576,7 +1576,7 @@ public final class ChaoxingHook extends XposedModule {
         if (lower.contains("course") || lower.contains("work") || lower.contains("exam")
                 || lower.contains("mooc") || lower.contains("fanya") || lower.contains("chaoxing")
                 || lower.contains("章节") || lower.contains("作业") || lower.contains("考试")) {
-            log(Log.INFO, TAG, source + ": " + url);
+            log(Log.INFO, TAG, source + ": matched deadline-related url");
             emitStatus("url", source);
         }
         inspect(url, ParseContext.fromSource(source, url));
@@ -1682,7 +1682,7 @@ public final class ChaoxingHook extends XposedModule {
                 builder.append(line).append('\n');
             }
             String body = builder.toString();
-            log(Log.INFO, TAG, "active fetched " + code + " " + source + " " + url + " len=" + body.length());
+            log(Log.INFO, TAG, "active fetched " + code + " " + source + " len=" + body.length());
             if (body.contains("invalid_verify") || body.contains("请输入验证码")) {
                 antiSpiderUntil = System.currentTimeMillis() + 30L * 60L * 1000L;
                 log(Log.WARN, TAG, "chapter fetch paused because Chaoxing requested verification");
@@ -1691,7 +1691,7 @@ public final class ChaoxingHook extends XposedModule {
             }
             return inspect(body, ctx);
         } catch (Throwable throwable) {
-            log(Log.WARN, TAG, "fetch failed " + url + ": " + throwable);
+            log(Log.WARN, TAG, "fetch failed " + source + ": " + throwable.getClass().getSimpleName());
             return -1;
         } finally {
             if (connection != null) {
@@ -2160,10 +2160,10 @@ public final class ChaoxingHook extends XposedModule {
                     PENDING.add(item);
                 }
             }
-            log(Log.WARN, TAG, "host context missing, queued item: " + item.title);
+            log(Log.WARN, TAG, "host context missing, queued deadline item");
             return;
         }
-        log(Log.INFO, TAG, "emit deadline item: " + item.title + " @ " + item.dueAt);
+        log(Log.INFO, TAG, "emit deadline item type=" + item.type);
         try {
             Intent intent = new Intent(DeadlineReceiver.ACTION_ITEM);
             intent.setComponent(new ComponentName(MODULE_PACKAGE, MODULE_PACKAGE + ".DeadlineReceiver"));

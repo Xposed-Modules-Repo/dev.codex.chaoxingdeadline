@@ -140,7 +140,7 @@ public final class DeadlineReceiver extends BroadcastReceiver {
                     .putLong("last_capture_at", System.currentTimeMillis())
                     .putString("last_capture_source", item.source)
                     .apply();
-            Log.i(TAG, "Stored deadline from " + item.source + ": " + item.title + " @ " + item.dueAt);
+            Log.i(TAG, "Stored deadline from " + item.source + " type=" + item.type);
             DeadlineNotifier.rescheduleAll(context);
             OverlayBridge.publish(context);
             context.sendBroadcast(new Intent(ACTION_REFRESH).setPackage(context.getPackageName()));
